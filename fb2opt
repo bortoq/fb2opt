@@ -26,6 +26,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 
@@ -38,8 +40,13 @@ BINARY_RE = re.compile(r"<binary\b([^>]*)>(.*?)</binary\s*>",
                        re.DOTALL | re.IGNORECASE)
 ID_RE = re.compile(r"""id\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
-TAG_GAP_RE = re.compile(r">\s*[\r\n]\s*<")
-MULTISPACE_RE = re.compile(r"\s{2,}")
+CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
+# Whitespace strictly between two tags (element-only content). Never touches text.
+GAP_RE = re.compile(r"(<[^<>]*>)[ \t\r\n]+(<[^<>]*>)")
+# Gaps between two of these render as a space: collapse to one space,
+# everywhere else the gap is removed entirely.
+INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
+                         "strong", "style", "sub", "sup"})
 
 DEPS: tuple[tuple[str, str], ...] = (
     ("ect", "lossless PNG / JPEG / ZIP compression"),
@@ -48,8 +55,12 @@ DEPS: tuple[tuple[str, str], ...] = (
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
+PNG_TRAILER = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
+
+VERSION = "4.0"
 
 
 class Fb2OptError(Exception):
@@ -67,6 +78,7 @@ class Fb2Stats:
     jpg_saved: int = 0
     other_saved: int = 0
     xml_saved: int = 0
+    skipped: int = 0  # binary blocks left alone (no id / broken base64)
 
     def add(self, other: "Fb2Stats") -> None:
         self.pics += other.pics
@@ -74,6 +86,7 @@ class Fb2Stats:
         self.jpg_saved += other.jpg_saved
         self.other_saved += other.other_saved
         self.xml_saved += other.xml_saved
+        self.skipped += other.skipped
 
     def breakdown(self) -> str:
         # Show only types with nonzero savings; zeros carry no information.
@@ -167,14 +180,46 @@ def encode_body(raw: bytes) -> str:
     return "\n" + "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)) + "\n"
 
 
+def _tag_name(tag: str) -> str:
+    """Tag name of `<...>` without brackets, slash or attributes ("" if none)."""
+    if not tag:
+        return ""
+    match = re.match(r"</?\s*([A-Za-z][\w:.-]*)", tag)
+    return match.group(1).lower() if match else ""
+
+
+def _gap_replace(match: re.Match) -> str:
+    """Collapse one inter-tag gap: one space between two inline tags, else nothing."""
+    left, right = match.group(1), match.group(2)
+    if _tag_name(left) in INLINE_TAGS and _tag_name(right) in INLINE_TAGS:
+        return f"{left} {right}"
+    return f"{left}{right}"
+
+
 def minify_skeleton(text: str) -> str:
-    """Minify the XML skeleton (<binary> bodies are placeholders here)."""
+    """Minify the XML skeleton without touching rendered text.
+
+    Only rendering-neutral transforms:
+      comments (outside CDATA) are dropped;
+      whitespace strictly between two tags collapses — one space stays
+      between two inline tags, everywhere else the gap is removed.
+    CDATA sections ride through masked and come back byte-exact.
+    """
     if not text:
         return text
-    text = COMMENT_RE.sub("", text)
-    text = TAG_GAP_RE.sub("><", text)
-    text = MULTISPACE_RE.sub(" ", text)
-    return text
+    token = uuid.uuid4().hex
+    cdata: list[str] = []
+
+    def _mask(match: re.Match) -> str:
+        cdata.append(match.group(0))
+        return f"__FB2OPT_CDATA_{token}_{len(cdata) - 1}__"
+
+    masked = CDATA_RE.sub(_mask, text)
+    masked = COMMENT_RE.sub("", masked)
+    masked = GAP_RE.sub(_gap_replace, masked)
+    for idx, section in enumerate(cdata):
+        masked = masked.replace(f"__FB2OPT_CDATA_{token}_{idx}__", section, 1)
+    return masked
 
 
 def decode_fb2_payload(payload: bytes) -> tuple[str, str]:
@@ -226,10 +271,12 @@ def short_hint() -> str:
         "fb2opt — lossless optimization of FB2 books (.fb2.zip).\n"
         "Usage:\n"
         "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
+        "  fb2opt -r LIBRARY [...]           walk folders, optimize every book\n"
         "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
         "  fb2opt --extract SRC [--dir OUT]  pull images (SRC: file or folder)\n"
         "  fb2opt --pack BOOK.fb2 [--dir D]  put images from folder D into the book\n"
         "  fb2opt --deps                     dependency status only\n"
+        "  fb2opt --version                  show version\n"
         "  fb2opt -h | --help                full help\n"
         f"{format_deps()}\n"
         "The original is replaced only if (old - new) > 0."
@@ -239,6 +286,17 @@ def short_hint() -> str:
 # --------------------------------------------------------------------------
 # Image optimization
 # --------------------------------------------------------------------------
+
+def _looks_complete(kind: str, data: bytes) -> bool:
+    """Sanity check: same header magic and a proper end marker."""
+    if not data:
+        return False
+    if kind == "png":
+        return data.startswith(PNG_MAGIC) and data.endswith(PNG_TRAILER)
+    if kind == "jpg":
+        return data.startswith(JPEG_MAGIC) and data.endswith(JPEG_TRAILER)
+    return True
+
 
 def optimize_images(images: list[_Image], workdir: str,
                     have_ect: bool, have_jpegoptim: bool) -> dict[int, bytes]:
@@ -282,7 +340,16 @@ def optimize_images(images: list[_Image], workdir: str,
         except OSError:
             optimized = img.raw
         # Guard against pessimization: keep the smaller.
-        result[img.idx] = optimized if 0 < len(optimized) < len(img.raw) else img.raw
+        if not 0 < len(optimized) < len(img.raw):
+            result[img.idx] = img.raw
+            continue
+        # The optimizer must return a complete image, not a truncated one.
+        if not _looks_complete(img.kind, optimized):
+            print(f"[warning] {img.img_id}: optimizer output failed validation, "
+                  f"kept original", file=sys.stderr)
+            result[img.idx] = img.raw
+            continue
+        result[img.idx] = optimized
         try:
             os.unlink(tmp)
         except OSError:
@@ -311,21 +378,25 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     images: list[_Image] = []
     skeleton_parts: list[str] = []
+    skipped = 0
+    token = uuid.uuid4().hex  # unique per document: literal text can never collide
     last = 0
     for idx, match in enumerate(matches):
         attrs, body = match.group(1), match.group(2)
         id_match = ID_RE.search(attrs or "")
         if not id_match:
+            skipped += 1
             continue  # block without id — leave fully alone
         raw = decode_body(body)
         if raw is None:
+            skipped += 1
             continue  # broken base64 — keep the block as is
         img_id = id_match.group(1)
         kind = detect_kind(raw, attrs or "")
         images.append(_Image(idx=idx, img_id=img_id, kind=kind,
                              raw=raw, orig_b64_len=len(body), attrs=attrs,
                              orig_body=body))
-        placeholder = f"__FB2OPT_{idx}__"
+        placeholder = f"__FB2OPT_{token}_{idx}__"
         skeleton_parts.append(text[last:match.start()])
         skeleton_parts.append(f"<binary{attrs}>{placeholder}</binary>")
         last = match.end()
@@ -334,7 +405,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     optimized = optimize_images(images, workdir, have_ect, have_jpegoptim)
 
-    stats = Fb2Stats(pics=len(images))
+    stats = Fb2Stats(pics=len(images), skipped=skipped)
     blocks: dict[int, str] = {}
     for img in images:
         final = optimized.get(img.idx, img.raw)
@@ -355,7 +426,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
-        new_skeleton = new_skeleton.replace(f"__FB2OPT_{img.idx}__",
+        new_skeleton = new_skeleton.replace(f"__FB2OPT_{token}_{img.idx}__",
                                             blocks[img.idx], 1)
     try:
         new_payload = new_skeleton.encode(encoding)
@@ -372,7 +443,124 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 # Writing the result under the "replace only if smaller" rule
 # --------------------------------------------------------------------------
 
-def _place_if_smaller(tmp_path: str, final_path: str, old_size: int) -> tuple[bool, int]:
+def _clone_info(info: zipfile.ZipInfo, compress_type: int | None = None
+                ) -> zipfile.ZipInfo:
+    """Copy a ZipInfo, optionally overriding the compression method."""
+    ni = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+    ni.compress_type = info.compress_type if compress_type is None else compress_type
+    ni.comment = info.comment
+    ni.extra = info.extra
+    ni.internal_attr = info.internal_attr
+    ni.external_attr = info.external_attr
+    ni.create_system = info.create_system
+    ni.create_version = info.create_version
+    ni.extract_version = info.extract_version
+    ni.flag_bits = info.flag_bits
+    ni.volume = info.volume
+    return ni
+
+
+def _drop_tmp(tmp_path: str, registry: list[str]) -> None:
+    """Remove a temp file and forget it. Never raises."""
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    try:
+        registry.remove(tmp_path)
+    except ValueError:
+        pass
+
+
+def _sweep_temps(registry: list[str]) -> None:
+    """Best-effort cleanup of leftover temp files (e.g. after Ctrl+C)."""
+    for tmp_path in list(registry):
+        _drop_tmp(tmp_path, registry)
+
+
+def _umask() -> int:
+    """Current umask without changing it."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _fresh_info(arcname: str, src_path: str) -> zipfile.ZipInfo:
+    """ZipInfo for a freshly packed file: source mtime, sane permissions."""
+    try:
+        mtime = os.path.getmtime(src_path)
+    except OSError:
+        mtime = time.time()
+    info = zipfile.ZipInfo(filename=arcname, date_time=time.localtime(mtime)[:6])
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = (0o644 & ~_umask()) << 16
+    return info
+
+
+def _write_candidate(entries: list[tuple[zipfile.ZipInfo, bytes]],
+                     archive_comment: bytes, base_dir: str,
+                     have_ect: bool, registry: list[str]) -> str:
+    """Repack entries into a temp ZIP next to the target. Returns its path."""
+    try:
+        handle, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".fb2opt-",
+                                            suffix=".zip")
+        os.close(handle)
+    except OSError as exc:
+        raise Fb2OptError(f"no write access to {base_dir}: {exc}") from exc
+    registry.append(tmp_path)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
+                              compresslevel=9) as zout:
+            for info, data in entries:
+                zout.writestr(info, data)
+            zout.comment = archive_comment
+    except OSError as exc:
+        _drop_tmp(tmp_path, registry)
+        raise Fb2OptError(f"failed to pack: {exc}") from exc
+    # ect -zip strips comments, so member comments are kept by skipping
+    # the ect pass for such archives (rare); the archive comment is cheap
+    # to restore afterwards.
+    if have_ect and not any(info.comment for info, _ in entries):
+        run_tool(["ect", "-9", "-zip", "-keep", tmp_path])
+        _verify_candidate(tmp_path, [info.filename for info, _ in entries],
+                          registry)
+    if archive_comment:
+        try:
+            with zipfile.ZipFile(tmp_path, "a") as zfix:
+                zfix.comment = archive_comment
+        except OSError:
+            pass
+    return tmp_path
+
+
+def _verify_candidate(tmp_path: str, expected_names: list[str],
+                      registry: list[str]) -> None:
+    """Check the archive an external optimizer just touched.
+
+    A broken/truncated candidate must never replace the original.
+    """
+    try:
+        with zipfile.ZipFile(tmp_path, "r") as check:
+            bad = check.testzip()
+            names = check.namelist()
+    except zipfile.BadZipFile as exc:
+        _drop_tmp(tmp_path, registry)
+        raise Fb2OptError(f"optimizer broke the archive, kept original: {exc}") from exc
+    if bad is not None or sorted(names) != sorted(expected_names):
+        _drop_tmp(tmp_path, registry)
+        raise Fb2OptError(f"optimizer broke the archive (bad member: {bad}), "
+                          f"kept original")
+
+
+def _warn_skipped(name: str, stats: Fb2Stats) -> None:
+    """Report binary blocks that were left alone (stderr, result line untouched)."""
+    if stats.skipped:
+        print(f"[warning] {name}: skipped {stats.skipped} bad <binary> blocks "
+              f"(no id or broken base64)", file=sys.stderr)
+
+
+def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
+                       registry: list[str]) -> tuple[bool, int]:
     """Atomically swap final_path with a temp file, only if it is smaller.
 
     Returns (replaced, new_size). The temp file always goes away:
@@ -383,26 +571,25 @@ def _place_if_smaller(tmp_path: str, final_path: str, old_size: int) -> tuple[bo
     new_size = os.path.getsize(tmp_path)
     saved = old_size - new_size
     if saved <= 0:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _drop_tmp(tmp_path, registry)
         return False, new_size
     try:
         if os.path.exists(final_path):
             shutil.copymode(final_path, tmp_path)
         os.replace(tmp_path, final_path)
     except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _drop_tmp(tmp_path, registry)
         raise Fb2OptError(f"failed to write the result: {exc}") from exc
+    try:
+        registry.remove(tmp_path)
+    except ValueError:
+        pass
     return True, new_size
 
 
 def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
-                       have_jpegoptim: bool) -> tuple[int, str]:
+                       have_jpegoptim: bool, registry: list[str]
+                       ) -> tuple[int, str]:
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
@@ -413,6 +600,7 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
         raise Fb2OptError(f"failed to read the size: {exc}") from exc
     try:
         with zipfile.ZipFile(path, "r") as zin:
+            archive_comment = zin.comment
             members = [(info, zin.read(info.filename)) for info in zin.infolist()]
     except zipfile.BadZipFile as exc:
         raise Fb2OptError(f"broken ZIP: {exc}") from exc
@@ -421,11 +609,11 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
     img_workdir = os.path.join(tmp_root, "img")
     stats = Fb2Stats()
-    new_members: list[tuple[zipfile.ZipInfo, bytes]] = []
+    entries: list[tuple[zipfile.ZipInfo, bytes]] = []
     fb2_count = 0
     for info, data in members:
         if info.is_dir():
-            new_members.append((info, data))
+            entries.append((_clone_info(info), data))
             continue
         if info.filename.lower().endswith(".fb2"):
             try:
@@ -435,42 +623,19 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
                 raise Fb2OptError(f"{info.filename}: {exc}") from exc
             stats.add(member_stats)
             fb2_count += 1
-            new_members.append((info, new_data))
+            entries.append((_clone_info(info, zipfile.ZIP_DEFLATED), new_data))
         else:
-            new_members.append((info, data))  # foreign files — byte for byte
+            entries.append((_clone_info(info), data))  # foreign files — byte for byte
     if fb2_count == 0:
         raise Fb2OptError("no .fb2 in the archive")
 
     base_dir = os.path.dirname(os.path.abspath(path))
-    handle, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".fb2opt-",
-                                        suffix=".zip")
-    os.close(handle)
-    try:
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
-                              compresslevel=9) as zout:
-            for info, data in new_members:
-                if info.is_dir():
-                    zout.writestr(info.filename, b"")
-                    continue
-                if info.filename.lower().endswith(".fb2"):
-                    zout.writestr(info.filename, data,
-                                  compress_type=zipfile.ZIP_DEFLATED,
-                                  compresslevel=9)
-                else:
-                    # keep foreign compression methods so foreign files do not grow
-                    zout.writestr(info.filename, data,
-                                  compress_type=info.compress_type)
-    except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise Fb2OptError(f"failed to pack: {exc}") from exc
+    tmp_path = _write_candidate(entries, archive_comment, base_dir,
+                                have_ect, registry)
 
-    if have_ect:
-        run_tool(["ect", "-9", "-zip", tmp_path])
-
-    replaced, _ = _place_if_smaller(tmp_path, os.path.abspath(path), old_size)
+    replaced, _ = _place_if_smaller(tmp_path, os.path.abspath(path), old_size,
+                                    registry)
+    _warn_skipped(name, stats)
     if not replaced:
         return 0, f"{name}: saved 0 bytes (already optimal, kept)"
     saved = old_size - os.path.getsize(os.path.abspath(path))
@@ -478,7 +643,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
-                       have_jpegoptim: bool) -> tuple[int, str]:
+                       have_jpegoptim: bool, registry: list[str]
+                       ) -> tuple[int, str]:
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
@@ -495,41 +661,28 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
                                               have_ect, have_jpegoptim)
 
     target = abs_path + ".zip"
-    arcname = os.path.basename(abs_path)
-    base_dir = os.path.dirname(abs_path)
-    handle, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".fb2opt-",
-                                        suffix=".zip")
-    os.close(handle)
+    entries = [(_fresh_info(os.path.basename(abs_path), abs_path), new_payload)]
+    tmp_path = _write_candidate(entries, b"", os.path.dirname(abs_path),
+                                have_ect, registry)
     try:
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
-                              compresslevel=9) as zout:
-            zout.writestr(arcname, new_payload,
-                          compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
-    except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise Fb2OptError(f"failed to pack: {exc}") from exc
-
-    if have_ect:
-        run_tool(["ect", "-9", "-zip", tmp_path])
+        os.chmod(tmp_path, 0o666 & ~_umask())  # fresh files: normal perms, not 0600
+    except OSError:
+        pass
 
     try:
         new_size = os.path.getsize(tmp_path)
     except OSError as exc:
+        _drop_tmp(tmp_path, registry)
         raise Fb2OptError(f"temp file is gone: {exc}") from exc
 
     if os.path.exists(target):
         try:
             old_size = os.path.getsize(target)
         except OSError as exc:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            _drop_tmp(tmp_path, registry)
             raise Fb2OptError(f"failed to read {target}: {exc}") from exc
-        replaced, _ = _place_if_smaller(tmp_path, target, old_size)
+        replaced, _ = _place_if_smaller(tmp_path, target, old_size, registry)
+        _warn_skipped(name, stats)
         if not replaced:
             return 0, (f"{name}: saved 0 bytes "
                        f"(existing {os.path.basename(target)} is no worse, kept)")
@@ -538,35 +691,41 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
     old_size = len(payload)
     if new_size >= old_size:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _drop_tmp(tmp_path, registry)
+        _warn_skipped(name, stats)
         return 0, (f"{name}: saved 0 bytes "
                    f"(compressed copy is bigger, not created)")
     try:
         os.replace(tmp_path, target)
     except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _drop_tmp(tmp_path, registry)
         raise Fb2OptError(f"failed to write {target}: {exc}") from exc
+    try:
+        registry.remove(tmp_path)
+    except ValueError:
+        pass
+    _warn_skipped(name, stats)
     return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
                                  f"({stats.breakdown()}) → {os.path.basename(target)}")
 
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
-                  have_jpegoptim: bool) -> tuple[int, str]:
+                  have_jpegoptim: bool, registry: list[str]) -> tuple[int, str]:
     """Optimize a single file; errors come as Fb2OptError."""
     if not isinstance(path, str) or not path:
         raise Fb2OptError("empty file name")
+    if os.path.islink(path):
+        return 0, f"{os.path.basename(path)}: skipped (symlink, left untouched)"
+    if os.path.isdir(path):
+        raise Fb2OptError("is a directory (use -r to walk it)")
     lowered = path.lower()
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
-        return optimize_zip_file(path, per_file_tmp, have_ect, have_jpegoptim)
+        return optimize_zip_file(path, per_file_tmp, have_ect, have_jpegoptim,
+                                 registry)
     if lowered.endswith(".fb2"):
-        return optimize_fb2_file(path, per_file_tmp, have_ect, have_jpegoptim)
+        return optimize_fb2_file(path, per_file_tmp, have_ect, have_jpegoptim,
+                                 registry)
     raise Fb2OptError("need .fb2 or .zip")
 
 
@@ -607,8 +766,8 @@ def _payloads_from_file(path: str):
                 members = [(info.filename, zin.read(info.filename))
                            for info in zin.infolist()
                            if not info.is_dir() and info.filename.lower().endswith(".fb2")]
-        except (zipfile.BadZipFile, OSError) as exc:
-            print(f"[error] {path}: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[error] {path}: {type(exc).__name__}: {exc}", file=sys.stderr)
             return
         if not members:
             print(f"[info] {path}: no .fb2 in the archive", file=sys.stderr)
@@ -698,6 +857,11 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
         return 2
     failures = 0
     for path in fb2_files:
+        if isinstance(path, str) and path.lower().endswith(".zip"):
+            print(f"[error] --pack needs an unpacked .fb2, not an archive: {path}",
+                  file=sys.stderr)
+            failures += 1
+            continue
         if not os.path.isfile(path):
             print(f"[error] {path}: file not found", file=sys.stderr)
             failures += 1
@@ -770,7 +934,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                     "The original is replaced only if the new file is smaller.",
         epilog=format_deps(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("files", nargs="*", help="books .fb2.zip / .fb2 (--extract: sources)")
+    parser.add_argument("files", nargs="*", help="books .fb2.zip / .fb2 (--extract: sources; with -r: folders to walk)")
     parser.add_argument("--extract", action="store_true",
                         help="pull images out of books")
     parser.add_argument("--pack", action="store_true",
@@ -782,6 +946,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="show dependencies and exit")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                        help="walk folders and optimize every .fb2/.zip inside")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="keep temp files (debugging)")
     return parser.parse_args(argv)
@@ -804,10 +971,28 @@ def main(argv: list[str] | None = None) -> int:
     if not args.files:
         print(short_hint())
         return 2
-    return _run_optimize_batch(args.files, args.quiet, args.keep_tmp)
+    return _run_optimize_batch(args.files, args.quiet, args.keep_tmp,
+                                 args.recursive)
 
 
-def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool) -> int:
+def _expand_sources(files: list[str], recursive: bool) -> list[str]:
+    """Expand folders into book files when -r is given, else pass through."""
+    if not files:
+        return []
+    expanded: list[str] = []
+    for item in files:
+        if recursive and isinstance(item, str) and os.path.isdir(item):
+            for root, _, names in os.walk(item):
+                for fn in sorted(names):
+                    if fn.lower().endswith((".fb2", ".zip")):
+                        expanded.append(os.path.join(root, fn))
+            continue
+        expanded.append(item)
+    return expanded
+
+
+def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
+                        recursive: bool) -> int:
     """Optimize a file list without falling on the first broken one."""
     deps = dict((name, found) for name, _, found in dep_status())
     have_ect = deps.get("ect", False)
@@ -816,37 +1001,50 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool) -> int:
         missing = " ".join(n for n, f in deps.items() if not f) or "?"
         print(f"[warning] missing optimizers: {missing} — "
               f"only XML and ZIP will shrink", file=sys.stderr)
+    expanded = _expand_sources(files, recursive)
     failures = 0
     total_saved = 0
-    if keep_tmp:
-        tmp_root = tempfile.mkdtemp(prefix="fb2opt-")
+    registry: list[str] = []
+
+    def _one(path: str, tmp_root: str) -> None:
+        nonlocal failures, total_saved
+        try:
+            saved, line = _optimize_one(path, tmp_root, have_ect, have_jpegoptim,
+                                        registry)
+        except Fb2OptError as exc:
+            print(f"[error] {path}: {exc}", file=sys.stderr)
+            failures += 1
+            return
+        except Exception as exc:
+            # One bad file (encrypted/odd ZIP, bad disk) must not kill the batch.
+            print(f"[error] {path}: unexpected {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            failures += 1
+            return
+        total_saved += saved
         if not quiet:
-            print(f"[debug] temp files: {tmp_root}")
-        for path in files:
-            try:
-                saved, line = _optimize_one(path, tmp_root, have_ect, have_jpegoptim)
-            except Fb2OptError as exc:
-                print(f"[error] {path}: {exc}", file=sys.stderr)
-                failures += 1
-                continue
-            total_saved += saved
+            print(line)
+
+    try:
+        if keep_tmp:
+            tmp_root = tempfile.mkdtemp(prefix="fb2opt-")
             if not quiet:
-                print(line)
-    else:
-        with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
-            for path in files:
-                try:
-                    saved, line = _optimize_one(path, tmp_root, have_ect,
-                                                have_jpegoptim)
-                except Fb2OptError as exc:
-                    print(f"[error] {path}: {exc}", file=sys.stderr)
-                    failures += 1
-                    continue
-                total_saved += saved
-                if not quiet:
-                    print(line)
-    if not quiet and len(files) > 1:
-        print(f"Total: {len(files)} files, saved {total_saved} bytes")
+                print(f"[debug] temp files: {tmp_root}")
+            for path in expanded:
+                _one(path, tmp_root)
+        else:
+            with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
+                for path in expanded:
+                    _one(path, tmp_root)
+    except KeyboardInterrupt:
+        _sweep_temps(registry)
+        print("[interrupted]", file=sys.stderr)
+        return 130
+    _sweep_temps(registry)
+    if not quiet and len(expanded) > 1:
+        file_word = "file" if len(expanded) == 1 else "files"
+        byte_word = "byte" if total_saved == 1 else "bytes"
+        print(f"Total: {len(expanded)} {file_word}, saved {total_saved} {byte_word}")
     return 1 if failures else 0
 
 

@@ -32,10 +32,12 @@ chmod +x ~/bin/fb2opt
 
 ```sh
 fb2opt BOOK.fb2.zip [BOOK2.fb2.zip ...]   # optimize (replace only if smaller)
+fb2opt -r LIBRARY [...]                   # walk folders, optimize every book
 fb2opt BOOK.fb2 [...]                     # pack raw .fb2 into .fb2.zip next to it
 fb2opt --extract SRC [--dir OUT]          # pull images (SRC: file or folder)
 fb2opt --pack BOOK.fb2 [--dir IMGDIR]     # put images from IMGDIR into the book
 fb2opt --deps                             # show dependencies
+fb2opt --version                          # show version
 fb2opt -h                                 # full help
 ```
 
@@ -50,6 +52,17 @@ unpacked-FB2 breakdown by type: `xml` (markup), `png`, `jpg`
 (`other` appears only if such images exist). Only types with
 nonzero savings are shown. The bracket numbers always sum to
 the unpacked FB2 delta.
+
+## Safety notes
+
+- The tool is lossless by design, but keep backups of books you care about.
+- Originals are replaced only when the new file is smaller; replacement
+  is atomic (`os.replace`), so a crash never leaves a half-written book.
+- Symlinks are skipped, never followed or replaced.
+- In-place optimization breaks hardlinks (the replaced file gets a new inode).
+- ZIP dates, permissions and comments are preserved. If an archive (or any
+  member) carries a comment, the final `ect -zip` pass is skipped so the
+  comments survive — at the cost of a few bytes of extra squeezing.
 
 ## License
 
