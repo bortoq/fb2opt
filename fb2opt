@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fb2opt — lossless optimization of FB2 books (.fb2.zip).
+
+One file, three modes:
+  optimize (default) — recompress images (PNG/JPEG) and XML, repack the ZIP;
+  --extract          — pull images out of a book;
+  --pack             — put images from a folder back into a book.
+
+Replacement rule:
+  the new file replaces the old one ONLY if (old_size - new_size) > 0,
+  otherwise the original is left untouched.
+
+The result line shows total saved bytes on disk, followed — in the same
+brackets — by the unpacked-FB2 breakdown by type: xml (markup), png, jpg.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass, field
+
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+BINARY_RE = re.compile(r"<binary\b([^>]*)>(.*?)</binary\s*>",
+                       re.DOTALL | re.IGNORECASE)
+ID_RE = re.compile(r"""id\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+TAG_GAP_RE = re.compile(r">\s*[\r\n]\s*<")
+MULTISPACE_RE = re.compile(r"\s{2,}")
+
+DEPS: tuple[tuple[str, str], ...] = (
+    ("ect", "lossless PNG / JPEG / ZIP compression"),
+    ("jpegoptim", "lossless JPEG compression, metadata cleanup"),
+)
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+TOOL_TIMEOUT = 600
+
+
+class Fb2OptError(Exception):
+    """Expected per-file error (printed, does not stop the batch)."""
+
+
+# --------------------------------------------------------------------------
+# Stats
+# --------------------------------------------------------------------------
+
+@dataclass
+class Fb2Stats:
+    pics: int = 0
+    png_saved: int = 0
+    jpg_saved: int = 0
+    other_saved: int = 0
+    xml_saved: int = 0
+
+    def add(self, other: "Fb2Stats") -> None:
+        self.pics += other.pics
+        self.png_saved += other.png_saved
+        self.jpg_saved += other.jpg_saved
+        self.other_saved += other.other_saved
+        self.xml_saved += other.xml_saved
+
+    def breakdown(self) -> str:
+        parts = [f"xml: {self.xml_saved}",
+                 f"png: {self.png_saved}",
+                 f"jpg: {self.jpg_saved}"]
+        if self.other_saved:
+            parts.append(f"other: {self.other_saved}")
+        return ", ".join(parts)
+
+
+@dataclass
+class _Image:
+    idx: int
+    img_id: str
+    kind: str            # png | jpg | gif | other
+    raw: bytes           # original image bytes
+    orig_b64_len: int    # base64 body length in the source file (as is)
+    attrs: str           # attributes of the <binary ...> tag
+    orig_body: str = ""   # original base64 body (for byte-exact keep)
+
+
+# --------------------------------------------------------------------------
+# Small pure helpers (guard clauses first)
+# --------------------------------------------------------------------------
+
+def sanitize_filename(name: object) -> str:
+    """Turn an image id into a safe file name."""
+    if not isinstance(name, str) or not name:
+        return "img"
+    safe = re.sub(r'[\\/*?:"\n<>|]', "_", name).strip()
+    return safe or "img"
+
+
+def run_tool(cmd: list[str]) -> bool:
+    """Run an external optimizer. Never raises."""
+    if not cmd:
+        return False
+    try:
+        done = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=TOOL_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def detect_kind(raw: bytes, attrs: str) -> str:
+    """Detect the image type: magic bytes first, then the tag hint."""
+    if not raw:
+        return "other"
+    if raw.startswith(PNG_MAGIC):
+        return "png"
+    if raw.startswith(JPEG_MAGIC):
+        return "jpg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    hint = (attrs or "").lower()
+    if "png" in hint:
+        return "png"
+    if "jpg" in hint or "jpeg" in hint:
+        return "jpg"
+    if "gif" in hint:
+        return "gif"
+    return "other"
+
+
+def decode_body(body: str) -> bytes | None:
+    """Decode a <binary> base64 body. None — broken block, keep it as is."""
+    if body is None:
+        return None
+    try:
+        cleaned = "".join(body.split())
+    except Exception:
+        return None
+    if not cleaned:
+        return None
+    try:
+        data = base64.b64decode(cleaned)
+    except (binascii.Error, ValueError):
+        return None
+    return data or None
+
+
+def encode_body(raw: bytes) -> str:
+    """Encode image bytes as canonical base64 (76-char lines)."""
+    b64 = base64.b64encode(raw).decode("ascii")
+    return "\n" + "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)) + "\n"
+
+
+def minify_skeleton(text: str) -> str:
+    """Minify the XML skeleton (<binary> bodies are placeholders here)."""
+    if not text:
+        return text
+    text = COMMENT_RE.sub("", text)
+    text = TAG_GAP_RE.sub("><", text)
+    text = MULTISPACE_RE.sub(" ", text)
+    return text
+
+
+def decode_fb2_payload(payload: bytes) -> tuple[str, str]:
+    """Decode FB2 bytes to text. Returns (text, encoding)."""
+    if payload is None:
+        raise Fb2OptError("empty FB2 data")
+    try:
+        return payload.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        return payload.decode("cp1251"), "cp1251"
+    except UnicodeDecodeError as exc:
+        raise Fb2OptError(f"unknown FB2 encoding: {exc}") from exc
+
+
+def unique_path(path: str) -> str:
+    """Pick a free file name (adds _2, _3, ... on collision)."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{stem}_{n}{ext}"):
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
+# --------------------------------------------------------------------------
+# Dependencies
+# --------------------------------------------------------------------------
+
+def dep_status() -> list[tuple[str, str, bool]]:
+    """External dependency status: [(name, role, found)]."""
+    return [(name, role, shutil.which(name) is not None) for name, role in DEPS]
+
+
+def format_deps() -> str:
+    """Dependency text block for the hint."""
+    lines = ["Dependencies:"]
+    for name, role, found in dep_status():
+        mark = "found" if found else "NOT FOUND"
+        lines.append(f"  {name:<10} {mark:<10} {role}")
+    return "\n".join(lines)
+
+
+def short_hint() -> str:
+    """Short hint for a run with no arguments."""
+    return (
+        "fb2opt — lossless optimization of FB2 books (.fb2.zip).\n"
+        "Usage:\n"
+        "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
+        "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
+        "  fb2opt --extract SRC [--dir OUT]  pull images (SRC: file or folder)\n"
+        "  fb2opt --pack BOOK.fb2 [--dir D]  put images from folder D into the book\n"
+        "  fb2opt --deps                     dependency status only\n"
+        "  fb2opt -h | --help                full help\n"
+        f"{format_deps()}\n"
+        "The original is replaced only if (old - new) > 0."
+    )
+
+
+# --------------------------------------------------------------------------
+# Image optimization
+# --------------------------------------------------------------------------
+
+def optimize_images(images: list[_Image], workdir: str,
+                    have_ect: bool, have_jpegoptim: bool) -> dict[int, bytes]:
+    """Run images through external optimizers.
+
+    Returns {idx: final_bytes}. Each image keeps the smaller of
+    (original, optimized) — a single file never grows.
+    """
+    result: dict[int, bytes] = {}
+    if not images:
+        return result
+    os.makedirs(workdir, exist_ok=True)
+    for img in images:
+        if not img.raw:
+            result[img.idx] = img.raw
+            continue
+        if img.kind not in ("png", "jpg"):
+            result[img.idx] = img.raw  # nothing compresses gif/other — keep as is
+            continue
+        if img.kind == "png" and not have_ect:
+            result[img.idx] = img.raw
+            continue
+        if img.kind == "jpg" and not have_jpegoptim:
+            result[img.idx] = img.raw
+            continue
+        tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
+                                    f".{img.kind if img.kind in ('png', 'jpg') else 'bin'}")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(img.raw)
+        except OSError:
+            result[img.idx] = img.raw
+            continue
+        if img.kind == "png":
+            run_tool(["ect", "-9", tmp])
+        else:
+            run_tool(["jpegoptim", "--strip-all", tmp])
+        try:
+            with open(tmp, "rb") as fh:
+                optimized = fh.read()
+        except OSError:
+            optimized = img.raw
+        # Guard against pessimization: keep the smaller.
+        result[img.idx] = optimized if 0 < len(optimized) < len(img.raw) else img.raw
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return result
+
+
+# --------------------------------------------------------------------------
+# Optimizing one FB2 document (in memory)
+# --------------------------------------------------------------------------
+
+def optimize_fb2_payload(payload: bytes, workdir: str,
+                         have_ect: bool, have_jpegoptim: bool
+                         ) -> tuple[bytes, Fb2Stats]:
+    """Optimize the bytes of one .fb2. Returns (new_bytes, stats).
+
+    The breakdown is exact at unpacked-FB2 level:
+      png/jpg/other — base64 body delta of images of that type;
+      xml — the rest of the total delta (comments, gaps between tags).
+    The breakdown sums to the unpacked FB2 delta.
+    """
+    if payload is None:
+        raise Fb2OptError("empty FB2 data")
+    text, encoding = decode_fb2_payload(payload)
+    matches = list(BINARY_RE.finditer(text))
+
+    images: list[_Image] = []
+    skeleton_parts: list[str] = []
+    last = 0
+    for idx, match in enumerate(matches):
+        attrs, body = match.group(1), match.group(2)
+        id_match = ID_RE.search(attrs or "")
+        if not id_match:
+            continue  # block without id — leave fully alone
+        raw = decode_body(body)
+        if raw is None:
+            continue  # broken base64 — keep the block as is
+        img_id = id_match.group(1)
+        kind = detect_kind(raw, attrs or "")
+        images.append(_Image(idx=idx, img_id=img_id, kind=kind,
+                             raw=raw, orig_b64_len=len(body), attrs=attrs,
+                             orig_body=body))
+        placeholder = f"__FB2OPT_{idx}__"
+        skeleton_parts.append(text[last:match.start()])
+        skeleton_parts.append(f"<binary{attrs}>{placeholder}</binary>")
+        last = match.end()
+    skeleton_parts.append(text[last:])
+    skeleton = "".join(skeleton_parts)
+
+    optimized = optimize_images(images, workdir, have_ect, have_jpegoptim)
+
+    stats = Fb2Stats(pics=len(images))
+    blocks: dict[int, str] = {}
+    for img in images:
+        final = optimized.get(img.idx, img.raw)
+        if final == img.raw:
+            # The skeleton already holds the tags around the placeholder: swap the body only.
+            # Original body = byte-exact same block, delta 0.
+            blocks[img.idx] = img.orig_body
+            continue
+        new_body = encode_body(final)
+        blocks[img.idx] = new_body
+        delta = img.orig_b64_len - len(new_body)
+        if img.kind == "png":
+            stats.png_saved += delta
+        elif img.kind == "jpg":
+            stats.jpg_saved += delta
+        else:
+            stats.other_saved += delta
+
+    new_skeleton = minify_skeleton(skeleton)
+    for img in images:
+        new_skeleton = new_skeleton.replace(f"__FB2OPT_{img.idx}__",
+                                            blocks[img.idx], 1)
+    try:
+        new_payload = new_skeleton.encode(encoding)
+    except (UnicodeEncodeError, LookupError) as exc:
+        raise Fb2OptError(f"failed to encode the result ({encoding}): {exc}") from exc
+
+    total_delta = len(payload) - len(new_payload)
+    img_delta = stats.png_saved + stats.jpg_saved + stats.other_saved
+    stats.xml_saved = total_delta - img_delta
+    return new_payload, stats
+
+
+# --------------------------------------------------------------------------
+# Writing the result under the "replace only if smaller" rule
+# --------------------------------------------------------------------------
+
+def _place_if_smaller(tmp_path: str, final_path: str, old_size: int) -> tuple[bool, int]:
+    """Atomically swap final_path with a temp file, only if it is smaller.
+
+    Returns (replaced, new_size). The temp file always goes away:
+    it either moves into place or is deleted.
+    """
+    if not os.path.isfile(tmp_path):
+        raise Fb2OptError("temp file is gone")
+    new_size = os.path.getsize(tmp_path)
+    saved = old_size - new_size
+    if saved <= 0:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False, new_size
+    try:
+        if os.path.exists(final_path):
+            shutil.copymode(final_path, tmp_path)
+        os.replace(tmp_path, final_path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise Fb2OptError(f"failed to write the result: {exc}") from exc
+    return True, new_size
+
+
+def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
+                       have_jpegoptim: bool) -> tuple[int, str]:
+    """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
+    if not os.path.isfile(path):
+        raise Fb2OptError("file not found")
+    name = os.path.basename(path)
+    try:
+        old_size = os.path.getsize(path)
+    except OSError as exc:
+        raise Fb2OptError(f"failed to read the size: {exc}") from exc
+    try:
+        with zipfile.ZipFile(path, "r") as zin:
+            members = [(info, zin.read(info.filename)) for info in zin.infolist()]
+    except zipfile.BadZipFile as exc:
+        raise Fb2OptError(f"broken ZIP: {exc}") from exc
+    except OSError as exc:
+        raise Fb2OptError(f"failed to unpack: {exc}") from exc
+
+    img_workdir = os.path.join(tmp_root, "img")
+    stats = Fb2Stats()
+    new_members: list[tuple[zipfile.ZipInfo, bytes]] = []
+    fb2_count = 0
+    for info, data in members:
+        if info.is_dir():
+            new_members.append((info, data))
+            continue
+        if info.filename.lower().endswith(".fb2"):
+            try:
+                new_data, member_stats = optimize_fb2_payload(
+                    data, img_workdir, have_ect, have_jpegoptim)
+            except Fb2OptError as exc:
+                raise Fb2OptError(f"{info.filename}: {exc}") from exc
+            stats.add(member_stats)
+            fb2_count += 1
+            new_members.append((info, new_data))
+        else:
+            new_members.append((info, data))  # foreign files — byte for byte
+    if fb2_count == 0:
+        raise Fb2OptError("no .fb2 in the archive")
+
+    base_dir = os.path.dirname(os.path.abspath(path))
+    handle, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".fb2opt-",
+                                        suffix=".zip")
+    os.close(handle)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
+                              compresslevel=9) as zout:
+            for info, data in new_members:
+                if info.is_dir():
+                    zout.writestr(info.filename, b"")
+                    continue
+                if info.filename.lower().endswith(".fb2"):
+                    zout.writestr(info.filename, data,
+                                  compress_type=zipfile.ZIP_DEFLATED,
+                                  compresslevel=9)
+                else:
+                    # keep foreign compression methods so foreign files do not grow
+                    zout.writestr(info.filename, data,
+                                  compress_type=info.compress_type)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise Fb2OptError(f"failed to pack: {exc}") from exc
+
+    if have_ect:
+        run_tool(["ect", "-9", "-zip", tmp_path])
+
+    replaced, _ = _place_if_smaller(tmp_path, os.path.abspath(path), old_size)
+    if not replaced:
+        return 0, f"{name}: saved 0 bytes (already optimal, kept)"
+    saved = old_size - os.path.getsize(os.path.abspath(path))
+    return saved, f"{name}: saved {saved} bytes ({stats.breakdown()})"
+
+
+def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
+                       have_jpegoptim: bool) -> tuple[int, str]:
+    """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
+    if not os.path.isfile(path):
+        raise Fb2OptError("file not found")
+    name = os.path.basename(path)
+    abs_path = os.path.abspath(path)
+    try:
+        with open(abs_path, "rb") as fh:
+            payload = fh.read()
+    except OSError as exc:
+        raise Fb2OptError(f"failed to read: {exc}") from exc
+
+    img_workdir = os.path.join(tmp_root, "img")
+    new_payload, stats = optimize_fb2_payload(payload, img_workdir,
+                                              have_ect, have_jpegoptim)
+
+    target = abs_path + ".zip"
+    arcname = os.path.basename(abs_path)
+    base_dir = os.path.dirname(abs_path)
+    handle, tmp_path = tempfile.mkstemp(dir=base_dir, prefix=".fb2opt-",
+                                        suffix=".zip")
+    os.close(handle)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
+                              compresslevel=9) as zout:
+            zout.writestr(arcname, new_payload,
+                          compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise Fb2OptError(f"failed to pack: {exc}") from exc
+
+    if have_ect:
+        run_tool(["ect", "-9", "-zip", tmp_path])
+
+    try:
+        new_size = os.path.getsize(tmp_path)
+    except OSError as exc:
+        raise Fb2OptError(f"temp file is gone: {exc}") from exc
+
+    if os.path.exists(target):
+        try:
+            old_size = os.path.getsize(target)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise Fb2OptError(f"failed to read {target}: {exc}") from exc
+        replaced, _ = _place_if_smaller(tmp_path, target, old_size)
+        if not replaced:
+            return 0, (f"{name}: saved 0 bytes "
+                       f"(existing {os.path.basename(target)} is no worse, kept)")
+        return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
+                                     f"({stats.breakdown()})")
+
+    old_size = len(payload)
+    if new_size >= old_size:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return 0, (f"{name}: saved 0 bytes "
+                   f"(compressed copy is bigger, not created)")
+    try:
+        os.replace(tmp_path, target)
+    except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise Fb2OptError(f"failed to write {target}: {exc}") from exc
+    return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
+                                 f"({stats.breakdown()}) → {os.path.basename(target)}")
+
+
+def _optimize_one(path: str, tmp_root: str, have_ect: bool,
+                  have_jpegoptim: bool) -> tuple[int, str]:
+    """Optimize a single file; errors come as Fb2OptError."""
+    if not isinstance(path, str) or not path:
+        raise Fb2OptError("empty file name")
+    lowered = path.lower()
+    per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
+    if lowered.endswith(".zip"):
+        return optimize_zip_file(path, per_file_tmp, have_ect, have_jpegoptim)
+    if lowered.endswith(".fb2"):
+        return optimize_fb2_file(path, per_file_tmp, have_ect, have_jpegoptim)
+    raise Fb2OptError("need .fb2 or .zip")
+
+
+# --------------------------------------------------------------------------
+# --extract mode
+# --------------------------------------------------------------------------
+
+def _iter_fb2_payloads(sources: list[str]):
+    """Yield (source_name, book_name, fb2_bytes) from files/folders."""
+    if not sources:
+        return
+    for src in sources:
+        if not isinstance(src, str) or not src or not os.path.exists(src):
+            print(f"[error] source not found: {src}", file=sys.stderr)
+            continue
+        if os.path.isdir(src):
+            for root, _, files in os.walk(src):
+                for fn in sorted(files):
+                    if fn.lower().endswith((".fb2", ".zip")):
+                        yield from _payloads_from_file(os.path.join(root, fn))
+        else:
+            yield from _payloads_from_file(src)
+
+
+def _payloads_from_file(path: str):
+    """FB2 bytes from one file (.fb2 directly, .zip — every nested .fb2)."""
+    lowered = path.lower()
+    if lowered.endswith(".fb2"):
+        try:
+            with open(path, "rb") as fh:
+                yield path, os.path.basename(path), fh.read()
+        except OSError as exc:
+            print(f"[error] {path}: cannot read: {exc}", file=sys.stderr)
+        return
+    if lowered.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(path, "r") as zin:
+                members = [(info.filename, zin.read(info.filename))
+                           for info in zin.infolist()
+                           if not info.is_dir() and info.filename.lower().endswith(".fb2")]
+        except (zipfile.BadZipFile, OSError) as exc:
+            print(f"[error] {path}: {exc}", file=sys.stderr)
+            return
+        if not members:
+            print(f"[info] {path}: no .fb2 in the archive", file=sys.stderr)
+        for member_name, data in members:
+            yield path, member_name, data
+        return
+    print(f"[error] {path}: need .fb2, .zip or a folder", file=sys.stderr)
+
+
+def cmd_extract(sources: list[str], out_dir: str, quiet: bool) -> int:
+    """Pull all images out of books into a folder. Returns the exit code."""
+    if not sources:
+        print("[error] --extract: give a file or a folder", file=sys.stderr)
+        return 2
+    if not out_dir:
+        print("[error] --extract: empty --dir", file=sys.stderr)
+        return 2
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"[error] folder {out_dir} not created: {exc}", file=sys.stderr)
+        return 1
+    count = 0
+    for src_path, book_name, payload in _iter_fb2_payloads(sources):
+        try:
+            text, _ = decode_fb2_payload(payload)
+        except Fb2OptError as exc:
+            print(f"[error] {src_path}: {exc}", file=sys.stderr)
+            continue
+        for match in BINARY_RE.finditer(text):
+            attrs, body = match.group(1), match.group(2)
+            id_match = ID_RE.search(attrs or "")
+            raw = decode_body(body)
+            if raw is None:
+                continue
+            kind = detect_kind(raw, attrs or "")
+            ext = {"png": "png", "jpg": "jpg", "gif": "gif"}.get(kind, "bin")
+            base = sanitize_filename(id_match.group(1)) if id_match else f"img_{count}"
+            stem, cur_ext = os.path.splitext(base)
+            fname = base if cur_ext.lower() == f".{ext}" else f"{stem or base}.{ext}"
+            dest = unique_path(os.path.join(out_dir, fname))
+            try:
+                with open(dest, "wb") as fh:
+                    fh.write(raw)
+            except OSError as exc:
+                print(f"[error] {dest}: not written: {exc}", file=sys.stderr)
+                continue
+            count += 1
+            if not quiet:
+                print(f"  -> {os.path.basename(dest)} (from {book_name})")
+    if not quiet:
+        print(f"[done] images pulled: {count} → {out_dir}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# --pack mode
+# --------------------------------------------------------------------------
+
+def _find_replacement(img_id: str, img_dir: str) -> str | None:
+    """Find the image file for an id among neighbors. None — not found."""
+    if not img_id or not img_dir or not os.path.isdir(img_dir):
+        return None
+    stem, _ = os.path.splitext(img_id)
+    candidates = [img_id,
+                  f"{img_id}.png", f"{img_id}.jpg", f"{img_id}.jpeg", f"{img_id}.gif",
+                  f"{stem}.png", f"{stem}.jpg", f"{stem}.jpeg", f"{stem}.gif"]
+    seen: set[str] = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        full = os.path.join(img_dir, name)
+        if os.path.isfile(full):
+            return full
+    return None
+
+
+def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
+    """Put images from a folder into a book. Input untouched, writes packed_*."""
+    if not fb2_files:
+        print("[error] --pack: give a .fb2 book", file=sys.stderr)
+        return 2
+    if not img_dir or not os.path.isdir(img_dir):
+        print(f"[error] --pack: no image folder: {img_dir}",
+              file=sys.stderr)
+        return 2
+    failures = 0
+    for path in fb2_files:
+        if not os.path.isfile(path):
+            print(f"[error] {path}: file not found", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            with open(path, "rb") as fh:
+                payload = fh.read()
+        except OSError as exc:
+            print(f"[error] {path}: cannot read: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            text, encoding = decode_fb2_payload(payload)
+        except Fb2OptError as exc:
+            print(f"[error] {path}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        updated = 0
+
+        def _replace(match: re.Match) -> str:
+            nonlocal updated
+            attrs, _body = match.group(1), match.group(2)
+            id_match = ID_RE.search(attrs or "")
+            if not id_match:
+                return match.group(0)
+            found = _find_replacement(id_match.group(1), img_dir)
+            if found is None:
+                return match.group(0)
+            try:
+                with open(found, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return match.group(0)
+            if not data:
+                return match.group(0)
+            updated += 1
+            if not quiet:
+                print(f"  [updated] {os.path.basename(found)} "
+                      f"-> id='{id_match.group(1)}'")
+            return f"<binary{attrs}>{encode_body(data)}</binary>"
+
+        new_text = BINARY_RE.sub(_replace, text)
+        if updated == 0:
+            if not quiet:
+                print(f"[info] {path}: no images to swap in {img_dir}")
+            continue
+        directory, base = os.path.split(os.path.abspath(path))
+        dest = unique_path(os.path.join(directory, f"packed_{base}"))
+        try:
+            with open(dest, "wb") as fh:
+                fh.write(new_text.encode(encoding))
+        except OSError as exc:
+            print(f"[error] {dest}: not written: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        if not quiet:
+            print(f"[done] {path}: images updated: {updated} → {dest}")
+    return 1 if failures else 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        prog="fb2opt",
+        description="Lossless optimization of FB2 books (.fb2.zip). "
+                    "The original is replaced only if the new file is smaller.",
+        epilog=format_deps(),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="*", help="books .fb2.zip / .fb2 (--extract: sources)")
+    parser.add_argument("--extract", action="store_true",
+                        help="pull images out of books")
+    parser.add_argument("--pack", action="store_true",
+                        help="put images from a folder into a book")
+    parser.add_argument("--dir", default="",
+                        help="for --extract: where to pull to (default: cwd); "
+                             "for --pack: where to take images from (default: cwd)")
+    parser.add_argument("--deps", action="store_true",
+                        help="show dependencies and exit")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="print errors only")
+    parser.add_argument("--keep-tmp", action="store_true",
+                        help="keep temp files (debugging)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Returns the exit code."""
+    args = parse_args(argv)
+    if args.deps:
+        print(format_deps())
+        return 0
+    if args.extract and args.pack:
+        print("[error] --extract and --pack do not mix", file=sys.stderr)
+        return 2
+    if args.extract:
+        return cmd_extract(args.files, args.dir or os.getcwd(), args.quiet)
+    if args.pack:
+        return cmd_pack(args.files, args.dir or os.getcwd(), args.quiet)
+    # Default mode — optimize. No files: short hint + dependencies.
+    if not args.files:
+        print(short_hint())
+        return 2
+    return _run_optimize_batch(args.files, args.quiet, args.keep_tmp)
+
+
+def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool) -> int:
+    """Optimize a file list without falling on the first broken one."""
+    deps = dict((name, found) for name, _, found in dep_status())
+    have_ect = deps.get("ect", False)
+    have_jpegoptim = deps.get("jpegoptim", False)
+    if not quiet and not (have_ect and have_jpegoptim):
+        missing = " ".join(n for n, f in deps.items() if not f) or "?"
+        print(f"[warning] missing optimizers: {missing} — "
+              f"only XML and ZIP will shrink", file=sys.stderr)
+    failures = 0
+    total_saved = 0
+    if keep_tmp:
+        tmp_root = tempfile.mkdtemp(prefix="fb2opt-")
+        if not quiet:
+            print(f"[debug] temp files: {tmp_root}")
+        for path in files:
+            try:
+                saved, line = _optimize_one(path, tmp_root, have_ect, have_jpegoptim)
+            except Fb2OptError as exc:
+                print(f"[error] {path}: {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            total_saved += saved
+            if not quiet:
+                print(line)
+    else:
+        with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
+            for path in files:
+                try:
+                    saved, line = _optimize_one(path, tmp_root, have_ect,
+                                                have_jpegoptim)
+                except Fb2OptError as exc:
+                    print(f"[error] {path}: {exc}", file=sys.stderr)
+                    failures += 1
+                    continue
+                total_saved += saved
+                if not quiet:
+                    print(line)
+    if not quiet and len(files) > 1:
+        print(f"Total: {len(files)} files, saved {total_saved} bytes")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
