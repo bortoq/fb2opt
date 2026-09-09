@@ -42,13 +42,14 @@ fb2opt -h                                 # full help
 Result line:
 
 ```text
-BOOK.fb2.zip: saved 126112 bytes (xml: 59555, png: 0, jpg: 74415)
+BOOK.fb2.zip: saved 126112 bytes (xml: 59555, jpg: 74415)
 ```
 
 The first number is real saved bytes on disk. In brackets — the
 unpacked-FB2 breakdown by type: `xml` (markup), `png`, `jpg`
-(`other` appears only if such images exist). The bracket numbers
-always sum to the unpacked FB2 delta.
+(`other` appears only if such images exist). Only types with
+nonzero savings are shown. The bracket numbers always sum to
+the unpacked FB2 delta.
 
 ## License
 

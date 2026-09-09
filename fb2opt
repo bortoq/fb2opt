@@ -76,11 +76,16 @@ class Fb2Stats:
         self.xml_saved += other.xml_saved
 
     def breakdown(self) -> str:
-        parts = [f"xml: {self.xml_saved}",
-                 f"png: {self.png_saved}",
-                 f"jpg: {self.jpg_saved}"]
-        if self.other_saved:
-            parts.append(f"other: {self.other_saved}")
+        # Show only types with nonzero savings; zeros carry no information.
+        parts = []
+        for label, value in (("xml", self.xml_saved),
+                             ("png", self.png_saved),
+                             ("jpg", self.jpg_saved),
+                             ("other", self.other_saved)):
+            if value:
+                parts.append(f"{label}: {value}")
+        if not parts:
+            parts.append("repack only")
         return ", ".join(parts)
 
 
