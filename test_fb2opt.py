@@ -727,8 +727,12 @@ class TestLossyBatchAndCli(unittest.TestCase):
             make_zip(zp, fb2)
             with mock.patch.object(mod, "_ssim_score", return_value=0.999):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
-                    with redirect_stdout(io.StringIO()):
-                        self.assertEqual(mod.main(["--lossy", zp]), 0)
+                    with mock.patch.object(mod, "have_ffmpeg",
+                                           return_value=True):
+                        with mock.patch.object(mod, "_lossy_tools_ok",
+                                               return_value=True):
+                            with redirect_stdout(io.StringIO()):
+                                self.assertEqual(mod.main(["--lossy", zp]), 0)
             self.assertTrue(os.path.exists(zp))
 
     def test_batch_survives_unexpected_exception(self):
@@ -1292,14 +1296,16 @@ class TestLossyMarker(unittest.TestCase):
         def _boom(a, b):
             raise AssertionError("metric must not run on marked")
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(mod, "_ssim_score", _boom):
-                self.assertIsNone(mod._lossy_variant(img, d, 0.92))
-                self.assertIsNone(mod._lossy_variant(img, d, 0.95))
+            with mock.patch.object(mod, "have_ffmpeg", return_value=True):
+                with mock.patch.object(mod, "_ssim_score", _boom):
+                    self.assertIsNone(mod._lossy_variant(img, d, 0.92))
+                    self.assertIsNone(mod._lossy_variant(img, d, 0.95))
         # stricter target re-opens the search (metric runs, may still lose)
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(mod, "_ssim_score", return_value=0.99):
-                with mock.patch.object(mod, "run_tool", lambda cmd: True):
-                    out = mod._lossy_variant(img, d, 0.85)
+            with mock.patch.object(mod, "have_ffmpeg", return_value=True):
+                with mock.patch.object(mod, "_ssim_score", return_value=0.99):
+                    with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                        out = mod._lossy_variant(img, d, 0.85)
         self.assertIsNotNone(out)
 
     def test_mark_written_and_honored_on_rerun(self):
@@ -1368,7 +1374,6 @@ class TestOutputInvariants(unittest.TestCase):
         noisy = (mod.PNG_MAGIC + _rnd.Random(11).randbytes(2000)
                  + mod.PNG_TRAILER)
         fb2 = make_fb2(base64.b64encode(noisy).decode())
-        haben = [(False, None), (True, None)]
         with tempfile.TemporaryDirectory() as d:
             for have_ect, lossy in ((False, None), (True, None),
                                     (False, 0.92), (True, 0.92)):
@@ -1401,9 +1406,12 @@ class TestOutputInvariants(unittest.TestCase):
             with mock.patch.object(mod, "_lossy_variant",
                                    return_value=(small.getvalue(), (8, 8))):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
-                    err = io.StringIO()
-                    with redirect_stderr(err):
-                        new, _ = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+                    with mock.patch.object(mod, "_lossy_tools_ok",
+                                           return_value=True):
+                        err = io.StringIO()
+                        with redirect_stderr(err):
+                            new, _ = mod.optimize_fb2_payload(
+                                fb2, d, False, 0.92)
         self.assertIn("cannot place lossy token", err.getvalue())
         self.assertIn(b'fb2opt-lossy="0.92"', new)  # protected, legacy way
         self.assertNotIn(b"__FB2OPT_", new)
@@ -1429,6 +1437,89 @@ class TestOutputInvariants(unittest.TestCase):
             names = _re.findall(rb'([a-zA-Z_:][-a-zA-Z0-9_.:]*)\s*=', tag)
             self.assertEqual(sorted(names), [b"content-type", b"id"],
                              f"unexpected attrs: {tag[:80]}")
+
+
+
+
+
+class TestReopenedAndWrapper(unittest.TestCase):
+    def _fb2_marked(self, target):
+        fb2 = make_fb2()
+        return fb2.replace(b'id="cover"',
+                           b'id="cover" fb2opt-lossy="%s"' % str(target).encode(),
+                           1)
+
+    def test_reopened_count_and_warning(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        fb2 = self._fb2_marked(0.95)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant", return_value=None):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    with mock.patch.object(mod, "_lossy_tools_ok",
+                                           return_value=True):
+                        new, stats = mod.optimize_fb2_payload(
+                            fb2, d, False, 0.85)
+        self.assertEqual(stats.reopened, 1)
+        self.assertEqual(stats.marked, 0)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            mod._warn_skipped("b.fb2.zip", stats)
+        self.assertIn("re-opened", err.getvalue())
+        self.assertIn("already-lossy", err.getvalue())
+
+    def test_wrapper_counted_in_marks(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        small = _io.BytesIO()
+        _gradient(8, 8).save(small, "PNG")
+        import random as _rnd2
+        rng = _rnd2.Random(9)
+        noise = bytes(rng.randrange(256) for _ in range(200 * 200 * 3))
+        from PIL import Image as _I2
+        big = _io.BytesIO()
+        _I2.frombytes("RGB", (200, 200), bytes(noise)).save(big, "PNG")
+        assert len(big.getvalue()) > mod.LOSSY_MIN_BYTES
+        fb2 = make_fb2(base64.b64encode(big.getvalue()).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small.getvalue(), (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    with mock.patch.object(mod, "_lossy_tools_ok",
+                                           return_value=True):
+                        _, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        token = mod._render_lossy_token({"cover": 0.92})
+        # make_fb2 has document-info but no program-used: +29 wrapper bytes
+        self.assertEqual(stats.marks, -(len(token) + 29))
+
+    def test_append_costs_one_space(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        small = _io.BytesIO()
+        _gradient(8, 8).save(small, "PNG")
+        import random as _rnd2
+        rng = _rnd2.Random(9)
+        noise = bytes(rng.randrange(256) for _ in range(200 * 200 * 3))
+        from PIL import Image as _I2
+        big = _io.BytesIO()
+        _I2.frombytes("RGB", (200, 200), bytes(noise)).save(big, "PNG")
+        assert len(big.getvalue()) > mod.LOSSY_MIN_BYTES
+        fb2 = make_fb2(base64.b64encode(big.getvalue()).decode())
+        fb2 = fb2.replace(b"<date value=",
+                          b"<program-used>Tool X</program-used><date value=", 1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small.getvalue(), (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    with mock.patch.object(mod, "_lossy_tools_ok",
+                                           return_value=True):
+                        new, stats = mod.optimize_fb2_payload(
+                            fb2, d, False, 0.92)
+        token = mod._render_lossy_token({"cover": 0.92})
+        self.assertEqual(stats.marks, -(len(token) + 1))
+        self.assertIn(b"Tool X " + token.encode(), new)
 
 
 if __name__ == "__main__":

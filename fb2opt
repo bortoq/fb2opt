@@ -105,10 +105,12 @@ class Fb2Stats:
     skipped: int = 0  # binary blocks left alone (no id / broken base64)
     marked: int = 0  # images already lossy-stamped, left untouched
     marks: int = 0  # annotation bytes saved (+) or spent (-) on lossy marks
+    reopened: int = 0  # stamped images re-opened at a stricter target
 
     def add(self, other: "Fb2Stats") -> None:
         self.marked += other.marked
         self.marks += other.marks
+        self.reopened += other.reopened
         self.pics += other.pics
         self.png_saved += other.png_saved
         self.jpg_saved += other.jpg_saved
@@ -344,7 +346,7 @@ def short_hint() -> str:
         "  fb2opt -r                         walk current folder (.fb2.zip, nested)\n"
         "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
         "  fb2opt --extract BOOK.fb2         pull images into current folder\n"
-        "  fb2opt --pack BOOK.fb2            images from current folder into the book\n"
+        "  fb2opt --pack BOOK.fb2            put images from current folder into the book\n"
         "  fb2opt -h | --help                full help\n"
 f"{format_deps()}\n"
         "The original is replaced only if (old - new) > 0."
@@ -618,8 +620,8 @@ def _render_lossy_token(marks: dict[str, float]) -> str:
     for target in targets:
         ids = sorted(i for i, t in marks.items() if t == target)
         try:
-            parts.append("%.4g:%s" % (target, ",".join(
-                quote(i, safe="") for i in ids)))
+            enc = ",".join(quote(i, safe="") for i in ids)
+            parts.append(f"{target:.4g}:{enc}")
         except Exception:
             continue
     if not parts:
@@ -657,6 +659,88 @@ def _strip_legacy_marks(text: str) -> tuple[str, int]:
     except Exception:
         return text, 0
     return out, removed[0]
+
+
+def _project_lossy_marks(text: str, images: list[_Image],
+                         lossy: float | None
+                         ) -> tuple[dict[str, float], set[str]]:
+    """Collect known marks (token + legacy tag attrs) and project them
+    into images, so the variant skip and the shield counter work unchanged.
+    Output tags are rewritten separately from real attrs plus one token.
+    """
+    known: dict[str, float] = {}
+    present: set[str] = set()
+    if lossy is None:
+        return known, present
+    try:
+        known = _parse_lossy_token(text)
+        for tag_m in re.finditer(r"<binary\b[^>]*>", text or "",
+                                 re.IGNORECASE):
+            tag = tag_m.group(0)
+            id_m = ID_RE.search(tag)
+            if not id_m:
+                continue
+            present.add(id_m.group(1))
+            mark = _lossy_mark(tag)
+            if mark is not None:
+                prev = known.get(id_m.group(1))
+                known[id_m.group(1)] = mark if prev is None else min(prev, mark)
+        for img in images:
+            if img.img_id in known and LOSSY_MARK + "=" not in (img.attrs or ""):
+                img.attrs = (f'{img.attrs or ""} {LOSSY_MARK}="'
+                             f'{known[img.img_id]:.4g}"')
+    except Exception:
+        return {}, present
+    return known, present
+
+
+def _write_lossy_token(skeleton: str, known: dict[str, float],
+                       present_ids: set[str], images: list[_Image],
+                       mark_set: set[int], lossy: float,
+                       real_attrs: dict[int, str]
+                       ) -> tuple[str, int, int, int]:
+    """Merge wins into the token, place it, migrate legacy marks.
+
+    Returns (skeleton, old_ann_bytes, new_ann_bytes, reopened_count).
+    reopened = images already stamped that a stricter target re-opens:
+    their quality is then measured against degraded pixels, not the
+    original — worth one stderr line. Never raises.
+    """
+    reopened = sum(1 for img in images
+                   if img.img_id in known and known[img.img_id] > lossy)
+    try:
+        for img in images:
+            if img.idx in mark_set:
+                known[img.img_id] = lossy
+        known = {iid: tgt for iid, tgt in known.items() if iid in present_ids}
+        token = _render_lossy_token(known)
+        if not token:
+            old_ann = _token_bytes(skeleton)
+            try:
+                skeleton = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", skeleton)
+            except Exception:
+                pass
+            return skeleton, old_ann, 0, reopened
+        pre_tok = _token_bytes(skeleton)
+        prog = re.search(r"(<program-used\b[^>]*>)(.*?)(</program-used\s*>)",
+                         skeleton, re.DOTALL | re.IGNORECASE)
+        extra = 0 if prog is None else (1 if prog.group(2).strip() else 0)
+        if prog is None:
+            extra = len("<program-used></program-used>")
+        cand, ok = _upsert_program_used(skeleton, token)
+        if ok:
+            final, legacy_bytes = _strip_legacy_marks(cand)
+            return final, pre_tok + legacy_bytes, len(token) + extra, reopened
+        print("[warning] cannot place lossy token, "
+              "stamping tags instead", file=sys.stderr)
+        for img in images:
+            if img.idx in mark_set:
+                skeleton = _patch_binary_attrs(
+                    skeleton, img.img_id,
+                    _set_lossy_mark(real_attrs[img.idx], lossy))
+        return skeleton, 0, 0, reopened
+    except Exception:
+        return skeleton, 0, 0, 0
 
 
 def _upsert_program_used(text: str, token: str) -> tuple[str, bool]:
@@ -1203,24 +1287,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     # images, so the variant skip and the shield counter work unchanged.
     # Output tags are rewritten from real attrs plus a single token.
     real_attrs = {img.idx: img.attrs for img in images}
-    known: dict[str, float] = {}
-    present_ids: set[str] = set()
-    if lossy is not None:
-        known = _parse_lossy_token(text)
-        for tag_m in re.finditer(r"<binary\b[^>]*>", text, re.IGNORECASE):
-            tag = tag_m.group(0)
-            id_m = ID_RE.search(tag)
-            if not id_m:
-                continue
-            present_ids.add(id_m.group(1))
-            mark = _lossy_mark(tag)
-            if mark is not None:
-                prev = known.get(id_m.group(1))
-                known[id_m.group(1)] = mark if prev is None else min(prev, mark)
-        for img in images:
-            if img.img_id in known and LOSSY_MARK + "=" not in (img.attrs or ""):
-                img.attrs = '%s %s="%.4g"' % (img.attrs or "", LOSSY_MARK,
-                                              known[img.img_id])
+    known, present_ids = _project_lossy_marks(text, images, lossy)
 
     lossy_marks: list[int] = []
     optimized = optimize_images(images, workdir, have_ect, lossy,
@@ -1261,34 +1328,10 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         skeleton = _patch_binary_attrs(skeleton, img_id, attrs)
     old_ann = new_ann = 0
     if lossy is not None:
-        for img in images:
-            if img.idx in mark_set:
-                known[img.img_id] = lossy
-        known = {iid: tgt for iid, tgt in known.items() if iid in present_ids}
-        lossy_token = _render_lossy_token(known)
-        if lossy_token:
-            pre_tok = _token_bytes(skeleton)
-            cand, ok = _upsert_program_used(skeleton, lossy_token)
-            if ok:
-                skeleton, legacy_bytes = _strip_legacy_marks(cand)
-                old_ann = pre_tok + legacy_bytes
-                new_ann = len(lossy_token)
-            else:
-                # No document-info to host a token (book already broken):
-                # fall back to tag stamps so the wins stay protected.
-                print("[warning] cannot place lossy token, "
-                      "stamping tags instead", file=sys.stderr)
-                for img in images:
-                    if img.idx in mark_set:
-                        skeleton = _patch_binary_attrs(
-                            skeleton, img.img_id,
-                            _set_lossy_mark(real_attrs[img.idx], lossy))
-        else:
-            old_ann = _token_bytes(skeleton)
-            try:
-                skeleton = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", skeleton)
-            except Exception:
-                pass
+        skeleton, old_ann, new_ann, reopened = _write_lossy_token(
+            skeleton, known, present_ids, images, mark_set, lossy,
+            real_attrs)
+        stats.reopened += reopened
     stats.marks = old_ann - new_ann
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
@@ -1522,6 +1565,11 @@ def _warn_skipped(name: str, stats: Fb2Stats) -> None:
     if stats.marked:
         print(f"[info] {name}: {stats.marked} images already lossy-stamped, "
               f"left untouched (re-run --lossy only bites with a lower target)",
+              file=sys.stderr)
+    if stats.reopened:
+        print(f"[info] {name}: {stats.reopened} images re-opened "
+              f"at a stricter target — quality is measured against "
+              f"the already-lossy pixels, not the original",
               file=sys.stderr)
 
 

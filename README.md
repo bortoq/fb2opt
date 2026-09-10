@@ -118,6 +118,11 @@ file itself and guarded by a metric — nothing is taken on faith.
   smooth gradients show banding on zoom, invisible on e-ink gray).
   Text scans need higher qualities for the same score — the metric,
   not a fixed `-m70`, decides per image.
+- Escape hatch caveat: re-running with a strictly lower target
+  re-compresses from the already-lossy pixels (originals are not kept),
+  so the true quality to the original ends up below the new target.
+  The run prints how many stamped images it re-opened — for critical
+  books, compress once from the original instead.
 
 Even the default lossless mode re-encodes when it can prove
 pixel-identity: exact gray → L, palette slack trim, RGB→palette,
