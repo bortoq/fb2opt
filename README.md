@@ -17,9 +17,11 @@ a book, `--pack` puts images from a folder back into it.
 ## Requirements
 
 - Python 3 (standard library only).
-- Optional but recommended: `ect`. Without it only XML and ZIP
-  still shrink. Run `fb2opt` with no arguments to see
-  what was found.
+- Optional but recommended: `ect` **with `-progressive` support**
+  (0.9.x — verify with `ect | grep -i progressive`). Without it only
+  XML and ZIP still shrink; with an older `ect` that lacks
+  `-progressive`, JPEGs are silently left untouched. Run `fb2opt`
+  with no arguments to see what was found.
 
 ## Install
 
@@ -61,6 +63,11 @@ the unpacked FB2 delta.
 - Temp-file cleanup only ever deletes `fb2opt`'s own `.fb2opt-*.zip`
   candidates, and after every batch the tool verifies that all inputs
   are still in place (a missing file is reported as an error).
+- JPEGs are re-encoded as **progressive** (`ect -9 -strip -progressive`).
+  Pixels stay lossless, but metadata (EXIF/ICC) is stripped, and very old
+  readers (early PocketBook/ONYX firmware, cheap hardware decoders) may
+  open progressive JPEGs slowly or not at all. If you read on such
+  a device, check one book first and keep a backup.
 - Symlinks are skipped, never followed or replaced.
 - In-place optimization breaks hardlinks (the replaced file gets a new inode).
 - ZIP dates, permissions and comments are preserved. If an archive (or any
