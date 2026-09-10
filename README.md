@@ -34,6 +34,7 @@ chmod +x ~/bin/fb2opt
 
 ```sh
 fb2opt BOOK.fb2.zip [BOOK2.fb2.zip ...]   # optimize (replace only if smaller)
+fb2opt --lossy BOOK.fb2.zip [...]         # also recompress PNG/JPEG with losses
 fb2opt -r LIBRARY [...]                   # walk folders, optimize every book
 fb2opt BOOK.fb2 [...]                     # pack raw .fb2 into .fb2.zip next to it
 fb2opt --extract SRC [--dir OUT]          # pull images (SRC: file or folder)
@@ -70,9 +71,33 @@ the unpacked FB2 delta.
   a device, check one book first and keep a backup.
 - Symlinks are skipped, never followed or replaced.
 - In-place optimization breaks hardlinks (the replaced file gets a new inode).
-- ZIP dates, permissions and comments are preserved. If an archive (or any
-  member) carries a comment, the final `ect -zip` pass is skipped so the
-  comments survive — at the cost of a few bytes of extra squeezing.
+- ZIP dates, permissions and comments are preserved. The final `ect -zip`
+  pass always runs; comments it strips (archive and member alike) are
+  restored afterwards, so nothing is sacrificed for the extra squeezing.
+
+## Lossy mode (`--lossy`)
+
+Opt-in: images are recompressed with losses when it pays off.
+
+- JPEG: quality ladder 60→95 (progressive, original chroma subsampling
+  kept); PNG: palette ladder 64→128→192 colors (no alpha images).
+- Each candidate is scored against the original with **SSIM via ffmpeg**;
+  the first candidate with SSIM ≥ threshold wins (default 0.99,
+  `--lossy-ssim` overrides). Quality choice is *not* monotonic under
+  re-compression, so the ladder is walked upward instead of bisecting.
+- The winner is squeezed losslessly (`ect`, same as above) and kept
+  **only if strictly smaller** than the lossless result — otherwise
+  the pixels stay bit-exact.
+- Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
+  refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
+
+## Text safety
+
+Markup minification never touches rendered text: whitespace between tags
+collapses (a single space survives between two inline tags), comments
+outside CDATA are dropped, CDATA returns byte-exact. Unlike some
+optimizers, fb2opt never glues words together (`one` + `two` stays
+two words, not `onetwo`).
 
 ## License
 

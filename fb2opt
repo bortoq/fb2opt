@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import io
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,11 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
+
+try:
+    from PIL import Image
+except ImportError:  # optional: only needed for --lossy
+    Image = None
 
 
 # --------------------------------------------------------------------------
@@ -50,6 +57,8 @@ INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
 
 DEPS: tuple[tuple[str, str], ...] = (
     ("ect", "lossless PNG / JPEG / ZIP compression, metadata stripping"),
+    ("Pillow", "lossy JPEG / PNG encoding (with --lossy only)"),
+    ("ffmpeg", "lossy quality metric SSIM (with --lossy only)"),
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -59,7 +68,9 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.1"
+VERSION = "4.2"
+
+LOSSY_DEFAULT_SSIM = 0.99
 
 
 class Fb2OptError(Exception):
@@ -257,9 +268,32 @@ def unique_path(path: str) -> str:
 # Dependencies
 # --------------------------------------------------------------------------
 
+def have_pil() -> bool:
+    """Pillow available (lossy encoder)."""
+    return Image is not None
+
+
+def have_ffmpeg() -> bool:
+    """ffmpeg available (lossy quality metric)."""
+    return shutil.which("ffmpeg") is not None
+
+
+def _lossy_tools_ok() -> bool:
+    """Everything --lossy needs: Pillow to encode, ffmpeg to measure."""
+    return have_pil() and have_ffmpeg()
+
+
+_DEP_CHECKS = {
+    "ect": lambda: shutil.which("ect") is not None,
+    "Pillow": have_pil,
+    "ffmpeg": have_ffmpeg,
+}
+
+
 def dep_status() -> list[tuple[str, str, bool]]:
     """External dependency status: [(name, role, found)]."""
-    return [(name, role, shutil.which(name) is not None) for name, role in DEPS]
+    return [(name, role, _DEP_CHECKS.get(name, lambda: False)())
+            for name, role in DEPS]
 
 
 def format_deps() -> str:
@@ -278,6 +312,7 @@ def short_hint() -> str:
         "Usage:\n"
         "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
         "  fb2opt -r LIBRARY [...]           walk folders, optimize every .fb2.zip\n"
+        "  fb2opt --lossy BOOK [...]           lossy PNG/JPEG (needs Pillow+ffmpeg)\n"
         "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
         "  fb2opt --extract SRC [--dir OUT]  pull images (SRC: file or folder)\n"
         "  fb2opt --pack BOOK.fb2 [--dir D]  put images from folder D into the book\n"
@@ -305,11 +340,14 @@ def _looks_complete(kind: str, data: bytes) -> bool:
 
 
 def optimize_images(images: list[_Image], workdir: str,
-                    have_ect: bool) -> dict[int, bytes]:
+                    have_ect: bool, lossy: float | None = None
+                    ) -> dict[int, bytes]:
     """Run images through external optimizers.
 
     Returns {idx: final_bytes}. Each image keeps the smaller of
     (original, optimized) — a single file never grows.
+    With lossy (min SSIM 0..1): a metric-gated lossy variant may win,
+    but only when strictly smaller than the lossless result.
     """
     result: dict[int, bytes] = {}
     if not images:
@@ -319,42 +357,259 @@ def optimize_images(images: list[_Image], workdir: str,
         if not img.raw:
             result[img.idx] = img.raw
             continue
-        if img.kind not in ("png", "jpg") or not have_ect:
-            result[img.idx] = img.raw  # gif/other need no tool; without ect keep as is
+        if img.kind not in ("png", "jpg"):
+            result[img.idx] = img.raw  # gif/other need no tool, keep as is
             continue
-        tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
-                                    f".{img.kind if img.kind in ('png', 'jpg') else 'bin'}")
+        if not have_ect and lossy is None:
+            result[img.idx] = img.raw  # nothing to do without any optimizer
+            continue
+        base = img.raw
+        if have_ect:
+            tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
+                                        f".{img.kind}")
+            try:
+                with open(tmp, "wb") as fh:
+                    fh.write(img.raw)
+            except OSError:
+                result[img.idx] = img.raw
+                continue
+            if img.kind == "png":
+                run_tool(["ect", "-9", tmp])
+            else:
+                run_tool(["ect", "-9", "-strip", "-progressive", tmp])
+            try:
+                with open(tmp, "rb") as fh:
+                    optimized = fh.read()
+            except OSError:
+                optimized = img.raw
+            # Guard against pessimization: keep the smaller.
+            if 0 < len(optimized) < len(img.raw):
+                # The optimizer must return a complete image, not a truncated one.
+                if _looks_complete(img.kind, optimized):
+                    base = optimized
+                else:
+                    print(f"[warning] {img.img_id}: optimizer output failed validation, "
+                          f"kept original", file=sys.stderr)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if lossy is not None and _lossy_tools_ok():
+            base = _try_lossy(img, workdir, lossy, base)
+        result[img.idx] = base
+    return result
+
+
+# --------------------------------------------------------------------------
+# Lossy recompression (--lossy), gated by a perceptual metric
+# --------------------------------------------------------------------------
+# JPEG quality is non-monotonic under SSIM (re-encoding at the original's
+# own quality re-quantizes almost idempotently, a nearby quality may score
+# worse), so the search walks a ladder upward and takes the first candidate
+# that meets the target — the smallest passing quality by construction.
+
+LOSSY_JPEG_LADDER = (60, 65, 70, 75, 80, 85, 90, 95)
+LOSSY_PNG_LADDER = (64, 128, 192)
+SSIM_TIMEOUT = 120
+
+
+def _pil_open(raw: bytes):
+    """Decode image bytes with Pillow. None — not decodable."""
+    if Image is None or not raw:
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+        return im
+    except Exception:
+        return None
+
+
+def _same_dims(raw: bytes, size: tuple[int, int]) -> bool:
+    """Decodable and dimensions unchanged."""
+    im = _pil_open(raw)
+    return im is not None and tuple(im.size) == tuple(size)
+
+
+def _ssim_score(ref_png: str, cand_png: str) -> float | None:
+    """SSIM All (0..1) between two PNGs via ffmpeg. None — metric unavailable."""
+    if not ref_png or not cand_png:
+        return None
+    try:
+        done = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", ref_png, "-i", cand_png,
+             "-lavfi", "ssim", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=SSIM_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        err = done.stderr.decode("utf-8", "replace")
+    except Exception:
+        return None
+    for line in err.splitlines():
+        if "SSIM " in line and "All:" in line:
+            try:
+                return float(line.split("All:")[1].split()[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _drop_paths(paths: list[str]) -> None:
+    """Best-effort removal of our own temp files. Never raises."""
+    for path in paths:
         try:
-            with open(tmp, "wb") as fh:
-                fh.write(img.raw)
-        except OSError:
-            result[img.idx] = img.raw
-            continue
-        if img.kind == "png":
-            run_tool(["ect", "-9", tmp])
-        else:
-            run_tool(["ect", "-9", "-strip", "-progressive", tmp])
-        try:
-            with open(tmp, "rb") as fh:
-                optimized = fh.read()
-        except OSError:
-            optimized = img.raw
-        # Guard against pessimization: keep the smaller.
-        if not 0 < len(optimized) < len(img.raw):
-            result[img.idx] = img.raw
-            continue
-        # The optimizer must return a complete image, not a truncated one.
-        if not _looks_complete(img.kind, optimized):
-            print(f"[warning] {img.img_id}: optimizer output failed validation, "
-                  f"kept original", file=sys.stderr)
-            result[img.idx] = img.raw
-            continue
-        result[img.idx] = optimized
-        try:
-            os.unlink(tmp)
+            os.unlink(path)
         except OSError:
             pass
-    return result
+
+
+def _lossy_jpeg(im, img: _Image, workdir: str, target: float
+                ) -> tuple[bytes, tuple[int, int]] | None:
+    """Cheapest JPEG quality with SSIM >= target. None — nothing qualifies."""
+    if im.mode not in ("RGB", "L", "P"):
+        return None  # CMYK / alpha / exotic: keep lossless
+    work = im if im.mode in ("RGB", "L") else im.convert("RGB")
+    ref = im.convert("RGB")
+    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
+    tmps: list[str] = []
+    try:
+        ref_path = stem + "_ref.png"
+        ref.save(ref_path)
+        tmps.append(ref_path)
+        for q in LOSSY_JPEG_LADDER:
+            cand_jpg = stem + "_c.jpg"
+            # 'keep' preserves the original chroma subsampling.
+            work.save(cand_jpg, "JPEG", quality=q, progressive=True,
+                      optimize=True, subsampling="keep")
+            tmps.append(cand_jpg)
+            try:
+                with open(cand_jpg, "rb") as fh:
+                    jb = fh.read()
+            except OSError:
+                continue
+            dec = _pil_open(jb)
+            if dec is None or tuple(dec.size) != tuple(ref.size):
+                continue
+            cand_png = stem + "_c.png"
+            dec.convert("RGB").save(cand_png)
+            tmps.append(cand_png)
+            score = _ssim_score(ref_path, cand_png)
+            if score is not None and score >= target:
+                return jb, tuple(ref.size)
+        return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        _drop_paths(tmps)
+
+
+def _lossy_png(im, img: _Image, workdir: str, target: float
+               ) -> tuple[bytes, tuple[int, int]] | None:
+    """Cheapest palette size with SSIM >= target. None — nothing qualifies."""
+    if "A" in im.getbands():
+        return None  # transparency must survive byte-exact: keep lossless
+    if im.mode not in ("RGB", "L", "P"):
+        return None
+    if im.mode == "P":
+        if im.info.get("transparency") is not None:
+            return None
+        try:
+            palette_size = len(im.getpalette()) // 3
+        except (TypeError, AttributeError):
+            palette_size = 256
+    else:
+        palette_size = 1 << 24
+    ref = im.convert("RGB")
+    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
+    tmps: list[str] = []
+    try:
+        ref_path = stem + "_ref.png"
+        ref.save(ref_path)
+        tmps.append(ref_path)
+        for n in LOSSY_PNG_LADDER:
+            if palette_size <= n:
+                continue  # nothing to quantize away
+            cand_png = stem + "_c.png"
+            im.convert("RGB").quantize(colors=n, method=Image.MEDIANCUT,
+                                       dither=Image.Dither.NONE).save(
+                                           cand_png, "PNG", optimize=True)
+            tmps.append(cand_png)
+            try:
+                with open(cand_png, "rb") as fh:
+                    pb = fh.read()
+            except OSError:
+                continue
+            dec = _pil_open(pb)
+            if dec is None or tuple(dec.size) != tuple(ref.size):
+                continue
+            score = _ssim_score(ref_path, cand_png)
+            if score is not None and score >= target:
+                return pb, tuple(ref.size)
+        return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        _drop_paths(tmps)
+
+
+def _lossy_variant(img: _Image, workdir: str, target: float
+                   ) -> tuple[bytes, tuple[int, int]] | None:
+    """Metric-gated lossy bytes for one image. None — keep the lossless path."""
+    if Image is None or not have_ffmpeg() or not img.raw:
+        return None
+    im = _pil_open(img.raw)
+    if im is None:
+        return None
+    if img.kind == "jpg":
+        return _lossy_jpeg(im, img, workdir, target)
+    if img.kind == "png":
+        return _lossy_png(im, img, workdir, target)
+    return None
+
+
+def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
+    """Replace base with a lossy variant only when strictly smaller and valid."""
+    if not base:
+        return base
+    variant = _lossy_variant(img, workdir, target)
+    if variant is None:
+        return base
+    vbytes, vsize = variant
+    if not 0 < len(vbytes) < len(base):
+        return base
+    # Squeeze the lossy bytes through the same lossless pass.
+    ltmp = os.path.join(workdir, f"lossy_{img.idx:04d}.{img.kind}")
+    try:
+        with open(ltmp, "wb") as fh:
+            fh.write(vbytes)
+    except OSError:
+        return base
+    try:
+        if img.kind == "png":
+            run_tool(["ect", "-9", ltmp])
+        else:
+            run_tool(["ect", "-9", "-strip", "-progressive", ltmp])
+        try:
+            with open(ltmp, "rb") as fh:
+                eco = fh.read()
+        except OSError:
+            return base
+        if not 0 < len(eco) < len(base):
+            return base
+        if not _looks_complete(img.kind, eco):
+            return base
+        if not _same_dims(eco, vsize):
+            return base
+        return eco
+    finally:
+        try:
+            os.unlink(ltmp)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -362,7 +617,8 @@ def optimize_images(images: list[_Image], workdir: str,
 # --------------------------------------------------------------------------
 
 def optimize_fb2_payload(payload: bytes, workdir: str,
-                         have_ect: bool) -> tuple[bytes, Fb2Stats]:
+                         have_ect: bool, lossy: float | None = None
+                         ) -> tuple[bytes, Fb2Stats]:
     """Optimize the bytes of one .fb2. Returns (new_bytes, stats).
 
     The breakdown is exact at unpacked-FB2 level:
@@ -402,7 +658,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     skeleton_parts.append(text[last:])
     skeleton = "".join(skeleton_parts)
 
-    optimized = optimize_images(images, workdir, have_ect)
+    optimized = optimize_images(images, workdir, have_ect, lossy)
 
     stats = Fb2Stats(pics=len(images), skipped=skipped)
     blocks: dict[int, str] = {}
@@ -537,11 +793,19 @@ def _write_candidate(entries: list[tuple[zipfile.ZipInfo, bytes]],
     except OSError as exc:
         _drop_tmp(tmp_path, registry)
         raise Fb2OptError(f"failed to pack: {exc}") from exc
-    # ect -zip strips comments, so member comments are kept by skipping
-    # the ect pass for such archives (rare); the archive comment is cheap
-    # to restore afterwards.
-    if have_ect and not any(info.comment for info, _ in entries):
+    # ect -zip strips comments, so they are restored afterwards: the archive
+    # comment via zipfile, member comments via central-directory surgery.
+    if have_ect:
+        member_comments = {info.filename: (info.comment or b"")
+                           for info, _ in entries}
         run_tool(["ect", "-9", "-zip", tmp_path])
+        _verify_candidate(tmp_path, [info.filename for info, _ in entries],
+                          registry)
+        if any(member_comments.values()) and not _restore_member_comments(
+                tmp_path, member_comments):
+            _drop_tmp(tmp_path, registry)
+            raise Fb2OptError("failed to restore ZIP member comments, "
+                              "kept original")
         _verify_candidate(tmp_path, [info.filename for info, _ in entries],
                           registry)
     if archive_comment:
@@ -551,6 +815,73 @@ def _write_candidate(entries: list[tuple[zipfile.ZipInfo, bytes]],
         except OSError:
             pass
     return tmp_path
+
+
+def _restore_member_comments(tmp_path: str, comments: dict[str, bytes]) -> bool:
+    """Put ZIP member comments back after an optimizer stripped them.
+
+    Rewrites only the central directory (local file data — the ect
+    compression — is untouched). Returns False on anything unexpected
+    (multi-disk, ZIP64); the caller then keeps the original.
+    """
+    if not tmp_path or not comments or not any(comments.values()):
+        return True
+    try:
+        with open(tmp_path, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return False
+    eocd_pos = blob.rfind(b"PK\x05\x06")
+    if eocd_pos < 0 or len(blob) < eocd_pos + 22:
+        return False
+    try:
+        disk, cd_disk, n_here, n_total, cd_size, cd_off, _arc = struct.unpack(
+            "<HHHHIIH", blob[eocd_pos + 4:eocd_pos + 22])
+    except struct.error:
+        return False
+    if disk != 0 or cd_disk != 0 or n_here != n_total:
+        return False
+    if cd_off + cd_size != eocd_pos:
+        return False
+    end = eocd_pos
+    pos = cd_off
+    out = bytearray()
+    while pos < end:
+        if blob[pos:pos + 4] != b"PK\x01\x02" or pos + 46 > end:
+            return False
+        try:
+            name_len, extra_len, com_len = struct.unpack(
+                "<HHH", blob[pos + 28:pos + 34])
+        except struct.error:
+            return False
+        head = blob[pos:pos + 46]
+        name = blob[pos + 46:pos + 46 + name_len]
+        extra = blob[pos + 46 + name_len:pos + 46 + name_len + extra_len]
+        tail = pos + 46 + name_len + extra_len + com_len
+        if tail > end:
+            return False
+        try:
+            fname = name.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                fname = name.decode("cp437")
+            except UnicodeDecodeError:
+                return False
+        new_com = comments.get(fname, b"") or b""
+        out += head[:32] + struct.pack("<H", len(new_com)) + head[34:]
+        out += name + extra + new_com
+        pos = tail
+    if pos != end:
+        return False
+    new_cd = bytes(out)
+    new_eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0,
+                           n_total, n_total, len(new_cd), cd_off, 0)
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(blob[:cd_off] + new_cd + new_eocd)
+    except OSError:
+        return False
+    return True
 
 
 def _verify_candidate(tmp_path: str, expected_names: list[str],
@@ -618,7 +949,8 @@ def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
 
 
 def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
-                       registry: list[str]) -> tuple[int, str]:
+                       registry: list[str], lossy: float | None = None
+                       ) -> tuple[int, str]:
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
@@ -647,7 +979,7 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
         if info.filename.lower().endswith(".fb2"):
             try:
                 new_data, member_stats = optimize_fb2_payload(
-                    data, img_workdir, have_ect)
+                    data, img_workdir, have_ect, lossy)
             except Fb2OptError as exc:
                 raise Fb2OptError(f"{info.filename}: {exc}") from exc
             stats.add(member_stats)
@@ -672,7 +1004,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
-                       registry: list[str]) -> tuple[int, str]:
+                       registry: list[str], lossy: float | None = None
+                       ) -> tuple[int, str]:
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
@@ -685,7 +1018,8 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
         raise Fb2OptError(f"failed to read: {exc}") from exc
 
     img_workdir = os.path.join(tmp_root, "img")
-    new_payload, stats = optimize_fb2_payload(payload, img_workdir, have_ect)
+    new_payload, stats = optimize_fb2_payload(payload, img_workdir, have_ect,
+                                               lossy)
 
     target = abs_path + ".zip"
     entries = [(_fresh_info(os.path.basename(abs_path), abs_path), new_payload)]
@@ -736,7 +1070,8 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
-                   registry: list[str]) -> tuple[int, str]:
+                   registry: list[str], lossy: float | None = None
+                   ) -> tuple[int, str]:
     """Optimize a single file; errors come as Fb2OptError."""
     if not isinstance(path, str) or not path:
         raise Fb2OptError("empty file name")
@@ -747,9 +1082,11 @@ def _optimize_one(path: str, tmp_root: str, have_ect: bool,
     lowered = path.lower()
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
-        return optimize_zip_file(path, per_file_tmp, have_ect, registry)
+        return optimize_zip_file(path, per_file_tmp, have_ect, registry,
+                                 lossy)
     if lowered.endswith(".fb2"):
-        return optimize_fb2_file(path, per_file_tmp, have_ect, registry)
+        return optimize_fb2_file(path, per_file_tmp, have_ect, registry,
+                                 lossy)
     raise Fb2OptError("need .fb2 or .zip")
 
 
@@ -972,6 +1309,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="print errors only")
     parser.add_argument("-r", "--recursive", action="store_true",
                         help="walk folders and optimize every .fb2.zip inside")
+    parser.add_argument("--lossy", action="store_true",
+                        help="recompress PNG/JPEG with losses (needs Pillow+ffmpeg); "
+                             "a lossy image is kept only if smaller")
+    parser.add_argument("--lossy-ssim", default=LOSSY_DEFAULT_SSIM, type=float,
+                        metavar="SSIM",
+                        help="with --lossy: keep SSIM >= value "
+                             f"(default {LOSSY_DEFAULT_SSIM})")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="keep temp files (debugging)")
@@ -991,12 +1335,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_extract(args.files, args.dir or os.getcwd(), args.quiet)
     if args.pack:
         return cmd_pack(args.files, args.dir or os.getcwd(), args.quiet)
+    if not 0.0 < args.lossy_ssim <= 1.0:
+        print(f"[error] --lossy-ssim must be within (0, 1], "
+              f"got {args.lossy_ssim}", file=sys.stderr)
+        return 2
+    lossy = args.lossy_ssim if args.lossy else None
     # Default mode — optimize. No files: short hint + dependencies.
     if not args.files:
         print(short_hint())
         return 2
     return _run_optimize_batch(args.files, args.quiet, args.keep_tmp,
-                                 args.recursive)
+                                 args.recursive, lossy)
 
 
 def _expand_sources(files: list[str], recursive: bool) -> list[str]:
@@ -1019,12 +1368,19 @@ def _expand_sources(files: list[str], recursive: bool) -> list[str]:
 
 
 def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
-                        recursive: bool) -> int:
+                        recursive: bool, lossy: float | None = None
+                        ) -> int:
     """Optimize a file list without falling on the first broken one."""
     have_ect = shutil.which("ect") is not None
     if not quiet and not have_ect:
         print("[warning] ect not found — only XML and ZIP will shrink",
               file=sys.stderr)
+    if lossy is not None and not _lossy_tools_ok():
+        missing = [m for m, ok in (("Pillow", have_pil()),
+                                   ("ffmpeg", have_ffmpeg())) if not ok]
+        print(f"[error] --lossy needs {' and '.join(missing)} "
+              f"(pip install pillow; apt install ffmpeg)", file=sys.stderr)
+        return 2
     expanded = _expand_sources(files, recursive)
     failures = 0
     total_saved = 0
@@ -1037,7 +1393,8 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
     def _one(path: str, tmp_root: str) -> None:
         nonlocal failures, total_saved
         try:
-            saved, line = _optimize_one(path, tmp_root, have_ect, registry)
+            saved, line = _optimize_one(path, tmp_root, have_ect, registry,
+                                        lossy)
         except Fb2OptError as exc:
             print(f"[error] {path}: {exc}", file=sys.stderr)
             failures += 1
