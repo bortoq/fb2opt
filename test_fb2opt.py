@@ -30,7 +30,11 @@ def make_fb2(png_b64=None, extra_binaries="", body_text="<p>Hello</p>"):
     return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
             "<FictionBook><description><title-info><genre>sf</genre>"
             "<author><first-name>A</first-name><last-name>B</last-name></author>"
-            "<book-title>T</book-title></title-info></description>"
+            "<book-title>T</book-title></title-info>"
+            "<document-info><author><first-name>A</first-name>"
+            "<last-name>B</last-name></author>"
+            "<date value=\"2020-01-01\">2020</date><id>test-id</id>"
+            "<version>1.0</version></document-info></description>"
             "<body><!-- a comment -->\n<section>\n"
             f"<title><p>  {body_text}  </p></title>"
             "<p>Keep   spaces   here</p>"
@@ -1238,12 +1242,45 @@ class TestLossyMarker(unittest.TestCase):
         self.assertAlmostEqual(
             mod._lossy_mark(' id="a" fb2opt-lossy="0.92"'), 0.92)
         self.assertIsNone(mod._lossy_mark(' fb2opt-lossy="junk"'))
-        out = mod._set_lossy_mark(' id="a"', 0.92)
-        self.assertIn('fb2opt-lossy="0.92"', out)
-        self.assertIn('id="a"', out)
-        twice = mod._set_lossy_mark(out, 0.85)
-        self.assertEqual(twice.count("fb2opt-lossy"), 1)
-        self.assertIn('"0.85"', twice)
+        self.assertEqual(
+            mod._strip_mark_from_attrs(' id="a" fb2opt-lossy="0.92"'),
+            ' id="a"')
+        self.assertEqual(mod._strip_mark_from_attrs(' id="a"'), ' id="a"')
+
+    def test_token_roundtrip(self):
+        marks = {"cover.jpg": 0.92, "pic 1,x;y=z": 0.85}
+        token = mod._render_lossy_token(marks)
+        self.assertTrue(token.startswith("fb2opt-lossy["))
+        back = mod._parse_lossy_token(" converted by X " + token + " done")
+        self.assertEqual(back, marks)
+        self.assertEqual(mod._render_lossy_token({}), "")
+        self.assertEqual(mod._parse_lossy_token("no token here"), {})
+        self.assertEqual(mod._parse_lossy_token("fb2opt-lossy[0.92]"), {})
+        self.assertEqual(mod._parse_lossy_token("fb2opt-lossy[xx:a]"), {})
+
+    def test_token_upsert(self):
+        base = ("<description><document-info><author><first-name>A</first-name>"
+                "</author><date>2020-01-01</date><id>1</id><version>1.0</version>"
+                "</document-info></description>")
+        out, ok = mod._upsert_program_used(base, "fb2opt-lossy[0.92:a]")
+        self.assertTrue(ok)
+        self.assertIn("<program-used>fb2opt-lossy[0.92:a]</program-used>", out)
+        self.assertLess(out.index("<program-used>"),
+                        out.index("<date>"))
+        again, ok = mod._upsert_program_used(out, "fb2opt-lossy[0.85:a,b]")
+        self.assertTrue(ok)
+        self.assertEqual(again.count("fb2opt-lossy["), 1)
+        self.assertIn("[0.85:a,b]", again)
+        # existing program-used text survives
+        src2 = base.replace("</author>",
+                            "</author><program-used>Any2Fb2</program-used>", 1)
+        out2, ok = mod._upsert_program_used(src2, "fb2opt-lossy[0.92:a]")
+        self.assertTrue(ok)
+        self.assertIn("Any2Fb2 fb2opt-lossy[0.92:a]", out2)
+        # no document-info at all: honest failure, input untouched
+        same, ok = mod._upsert_program_used("<a>text</a>", "fb2opt-lossy[0.9:x]")
+        self.assertFalse(ok)
+        self.assertEqual(same, "<a>text</a>")
 
     def test_variant_skips_marked(self):
         if not HAS_PIL:
@@ -1272,6 +1309,7 @@ class TestLossyMarker(unittest.TestCase):
         import random as _rnd
         from PIL import Image as _I
         small = _io.BytesIO()
+        # already minimal-palette: a re-run finds nothing to improve
         _gradient(8, 8).quantize(colors=8, method=_I.MEDIANCUT,
                                  dither=_I.Dither.NONE).save(small, "PNG")
         small_png = small.getvalue()
@@ -1284,7 +1322,8 @@ class TestLossyMarker(unittest.TestCase):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
                     new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
         text = new.decode("utf-8")
-        self.assertIn('fb2opt-lossy="0.92"', text)
+        self.assertIn("fb2opt-lossy[0.92:cover]", text)
+        self.assertNotIn('fb2opt-lossy="', text)  # tags stay schema-clean
         # re-run: marked image is shielded, metric never runs
         def _boom(a, b):
             raise AssertionError("metric must not run on marked")
@@ -1294,6 +1333,102 @@ class TestLossyMarker(unittest.TestCase):
                     new2, stats2 = mod.optimize_fb2_payload(new, d, False, 0.92)
         self.assertEqual(stats2.marked, 1)
         self.assertEqual(new2, new)
+
+    def test_legacy_attr_migrates_to_token(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        buf = _io.BytesIO()
+        _gradient(16, 16).save(buf, "PNG")
+        raw = buf.getvalue()
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        fb2 = fb2.replace(b'id="cover"',
+                          b'id="cover" fb2opt-lossy="0.92"', 1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                new, _ = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        text = new.decode("utf-8")
+        self.assertNotIn('fb2opt-lossy="', text)  # legacy gone from tags
+        self.assertIn("fb2opt-lossy[0.92:cover]", text)  # lives in token
+
+
+
+
+
+class TestOutputInvariants(unittest.TestCase):
+    def test_no_placeholders_survive(self):
+        # Shadowing a uuid placeholder variable once shipped books
+        # with __FB2OPT_ markers inside: never again, in any mode.
+        import io as _io
+        import random as _rnd
+        from PIL import Image as _I
+        small = _io.BytesIO()
+        _gradient(8, 8).quantize(colors=8, method=_I.MEDIANCUT,
+                                 dither=_I.Dither.NONE).save(small, "PNG")
+        noisy = (mod.PNG_MAGIC + _rnd.Random(11).randbytes(2000)
+                 + mod.PNG_TRAILER)
+        fb2 = make_fb2(base64.b64encode(noisy).decode())
+        haben = [(False, None), (True, None)]
+        with tempfile.TemporaryDirectory() as d:
+            for have_ect, lossy in ((False, None), (True, None),
+                                    (False, 0.92), (True, 0.92)):
+                with mock.patch.object(
+                        mod, "_lossy_variant",
+                        return_value=(small.getvalue(), (8, 8))):
+                    with mock.patch.object(mod, "run_tool",
+                                           lambda cmd: True):
+                        new, _ = mod.optimize_fb2_payload(
+                            fb2, d, have_ect, lossy)
+                self.assertNotIn(b"__FB2OPT_", new,
+                                 f"placeholder leaked (ect={have_ect}, lossy={lossy})")
+
+    def test_fallback_stamps_tags_without_document_info(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        small = _io.BytesIO()
+        _gradient(8, 8).save(small, "PNG")
+        import random as _rnd
+        raw = (mod.PNG_MAGIC + _rnd.Random(5).randbytes(3000)
+               + mod.PNG_TRAILER)
+        text = ("<?xml version='1.0'?><FictionBook><description><title-info>"
+                "<book-title>T</book-title></title-info></description>"
+                "<body><section><p>T</p></section></body>"
+                "<binary id='c' content-type='image/png'>"
+                + base64.b64encode(raw).decode() + "</binary></FictionBook>")
+        fb2 = text.encode("utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small.getvalue(), (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        new, _ = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        self.assertIn("cannot place lossy token", err.getvalue())
+        self.assertIn(b'fb2opt-lossy="0.92"', new)  # protected, legacy way
+        self.assertNotIn(b"__FB2OPT_", new)
+
+    def test_binary_tags_stay_schema_clean(self):
+        # Audit v8 §4: only id + content-type may sit on <binary>.
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        small = _io.BytesIO()
+        _gradient(8, 8).save(small, "PNG")
+        raw = (mod.PNG_MAGIC + b"q" * 3000 + mod.PNG_TRAILER)
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small.getvalue(), (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new, _ = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        import re as _re
+        tags = _re.findall(rb"<binary\b([^>]*)>", new)
+        self.assertTrue(tags)
+        for tag in tags:
+            names = _re.findall(rb'([a-zA-Z_:][-a-zA-Z0-9_.:]*)\s*=', tag)
+            self.assertEqual(sorted(names), [b"content-type", b"id"],
+                             f"unexpected attrs: {tag[:80]}")
 
 
 if __name__ == "__main__":

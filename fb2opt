@@ -34,6 +34,8 @@ import zipfile
 import zlib
 from dataclasses import dataclass, field
 
+from urllib.parse import quote, unquote
+
 try:
     from PIL import Image, ImageChops, ImageStat, PngImagePlugin
 except ImportError:  # optional: Pillow tools (lossy + smart lossless)
@@ -72,7 +74,7 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.4"
+VERSION = "4.5"
 
 # Smart image heuristics (real-world files of unknown origin).
 LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
@@ -102,9 +104,11 @@ class Fb2Stats:
     xml_saved: int = 0
     skipped: int = 0  # binary blocks left alone (no id / broken base64)
     marked: int = 0  # images already lossy-stamped, left untouched
+    marks: int = 0  # annotation bytes saved (+) or spent (-) on lossy marks
 
     def add(self, other: "Fb2Stats") -> None:
         self.marked += other.marked
+        self.marks += other.marks
         self.pics += other.pics
         self.png_saved += other.png_saved
         self.jpg_saved += other.jpg_saved
@@ -118,7 +122,8 @@ class Fb2Stats:
         for label, value in (("xml", self.xml_saved),
                              ("png", self.png_saved),
                              ("jpg", self.jpg_saved),
-                             ("other", self.other_saved)):
+                             ("other", self.other_saved),
+                             ("marks", self.marks)):
             if value:
                 parts.append(f"{label}: {value}")
         if not parts:
@@ -537,8 +542,20 @@ def _lossy_mark(attrs: str) -> float | None:
         return None
 
 
+def _strip_mark_from_attrs(attrs: str) -> str:
+    """Drop a parseable legacy lossy mark from a tag's attributes."""
+    if not attrs or _lossy_mark(attrs) is None:
+        return attrs
+    try:
+        return re.sub(r"\s*" + LOSSY_MARK + r'\s*=\s*"[0-9.]+"', "", attrs,
+                      count=1)
+    except Exception:
+        return attrs
+
+
 def _set_lossy_mark(attrs: str, target: float) -> str:
-    """Stamp (or refresh) the applied lossy target on a <binary> tag."""
+    """Stamp a lossy target on a tag (fallback for books with no place
+    for a token — keeps protection where validity is already broken)."""
     stamp = f'{LOSSY_MARK}="{target:.4g}"'
     if not attrs:
         return " " + stamp
@@ -548,6 +565,136 @@ def _set_lossy_mark(attrs: str, target: float) -> str:
     except Exception:
         return attrs
     return new_attrs if n else f"{attrs} {stamp}"
+
+
+def _parse_lossy_token(text: str) -> dict[str, float]:
+    """Read back {img_id: target} from program-used token(s)."""
+    out: dict[str, float] = {}
+    if not text:
+        return out
+    try:
+        spans = re.finditer(LOSSY_MARK + r"\[([^\]]*)\]", text or "")
+    except Exception:
+        return out
+    for span in spans:
+        try:
+            groups = span.group(1).split(";")
+        except Exception:
+            continue
+        for group in groups:
+            target_txt, sep, ids = group.partition(":")
+            if not sep:
+                continue
+            try:
+                target = float(target_txt)
+            except ValueError:
+                continue
+            if not 0.0 < target <= 1.0:
+                continue
+            for enc in ids.split(","):
+                enc = enc.strip()
+                if not enc:
+                    continue
+                try:
+                    iid = unquote(enc)
+                except Exception:
+                    continue
+                if not iid:
+                    continue
+                prev = out.get(iid)
+                out[iid] = target if prev is None else min(prev, target)
+    return out
+
+
+def _render_lossy_token(marks: dict[str, float]) -> str:
+    """Serialize {img_id: target} into one program-used token (stable order)."""
+    if not marks:
+        return ""
+    parts = []
+    try:
+        targets = sorted(set(marks.values()))
+    except Exception:
+        return ""
+    for target in targets:
+        ids = sorted(i for i, t in marks.items() if t == target)
+        try:
+            parts.append("%.4g:%s" % (target, ",".join(
+                quote(i, safe="") for i in ids)))
+        except Exception:
+            continue
+    if not parts:
+        return ""
+    return LOSSY_MARK + "[" + ";".join(parts) + "]"
+
+
+def _token_bytes(text: str) -> int:
+    """Total bytes of lossy tokens in the text (for annotation accounting)."""
+    try:
+        return sum(len(m.group(0)) for m in
+                   re.finditer(LOSSY_MARK + r"\[[^\]]*\]", text or ""))
+    except Exception:
+        return 0
+
+
+def _strip_legacy_marks(text: str) -> tuple[str, int]:
+    """Drop parseable legacy marks from <binary> tags. Returns (text, bytes)."""
+    removed = [0]
+
+    def _one(match: re.Match) -> str:
+        tag = match.group(0)
+        if _lossy_mark(tag) is None:
+            return tag
+        try:
+            new_tag = re.sub(r"\s*" + LOSSY_MARK + r'\s*=\s*"[0-9.]+"',
+                             "", tag, count=1)
+        except Exception:
+            return tag
+        removed[0] += len(tag) - len(new_tag)
+        return new_tag
+
+    try:
+        out = re.sub(r"<binary\b[^>]*>", _one, text, flags=re.IGNORECASE)
+    except Exception:
+        return text, 0
+    return out, removed[0]
+
+
+def _upsert_program_used(text: str, token: str) -> tuple[str, bool]:
+    """Place the token into <program-used> (create it if missing).
+
+    Position respects the schema sequence (after authors, before date).
+    Returns (text, ok); on failure the input comes back untouched.
+    """
+    if not text or not token:
+        return text, False
+    try:
+        cleaned = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", text)
+        prog = re.search(r"(<program-used\b[^>]*>)(.*?)(</program-used\s*>)",
+                         cleaned, re.DOTALL | re.IGNORECASE)
+        if prog:
+            body = prog.group(2).rstrip()
+            body = (body + " " + token) if body else token
+            new = (cleaned[:prog.start()] + prog.group(1) + body
+                   + prog.group(3) + cleaned[prog.end():])
+        else:
+            doc = re.search(r"<document-info\b[^>]*>(.*?)</document-info\s*>",
+                            cleaned, re.DOTALL | re.IGNORECASE)
+            if not doc:
+                return text, False
+            inner = doc.group(1)
+            elem = "<program-used>" + token + "</program-used>"
+            date = re.search(r"<date\b", inner, re.IGNORECASE)
+            if date:
+                new_inner = inner[:date.start()] + elem + inner[date.start():]
+            else:
+                new_inner = inner + elem
+            new = (cleaned[:doc.start(1)] + new_inner
+                   + cleaned[doc.end(1):])
+    except Exception:
+        return text, False
+    if not _parse_lossy_token(new):
+        return text, False
+    return new, True
 
 
 def _patch_binary_attrs(text: str, img_id: str, new_attrs: str) -> str:
@@ -1052,6 +1199,29 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     skeleton_parts.append(text[last:])
     skeleton = "".join(skeleton_parts)
 
+    # Project known marks (program-used token + legacy tag attrs) into
+    # images, so the variant skip and the shield counter work unchanged.
+    # Output tags are rewritten from real attrs plus a single token.
+    real_attrs = {img.idx: img.attrs for img in images}
+    known: dict[str, float] = {}
+    present_ids: set[str] = set()
+    if lossy is not None:
+        known = _parse_lossy_token(text)
+        for tag_m in re.finditer(r"<binary\b[^>]*>", text, re.IGNORECASE):
+            tag = tag_m.group(0)
+            id_m = ID_RE.search(tag)
+            if not id_m:
+                continue
+            present_ids.add(id_m.group(1))
+            mark = _lossy_mark(tag)
+            if mark is not None:
+                prev = known.get(id_m.group(1))
+                known[id_m.group(1)] = mark if prev is None else min(prev, mark)
+        for img in images:
+            if img.img_id in known and LOSSY_MARK + "=" not in (img.attrs or ""):
+                img.attrs = '%s %s="%.4g"' % (img.attrs or "", LOSSY_MARK,
+                                              known[img.img_id])
+
     lossy_marks: list[int] = []
     optimized = optimize_images(images, workdir, have_ect, lossy,
                                 lossy_marks)
@@ -1074,12 +1244,10 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         new_body = encode_body(final)
         blocks[img.idx] = new_body
         final_kind = detect_kind(final, "")
-        attrs = img.attrs
+        attrs = _strip_mark_from_attrs(real_attrs[img.idx])
         if final_kind in ("png", "jpg") and final_kind != img.kind:
             attrs = _set_content_type(attrs, final_kind)
-        if lossy is not None and img.idx in mark_set:
-            attrs = _set_lossy_mark(attrs, lossy)
-        if attrs != img.attrs:
+        if attrs != real_attrs[img.idx]:
             skeleton_late.append((img.img_id, attrs))
         delta = img.orig_b64_len - len(new_body)
         if img.kind == "png":
@@ -1091,6 +1259,37 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     for img_id, attrs in skeleton_late:
         skeleton = _patch_binary_attrs(skeleton, img_id, attrs)
+    old_ann = new_ann = 0
+    if lossy is not None:
+        for img in images:
+            if img.idx in mark_set:
+                known[img.img_id] = lossy
+        known = {iid: tgt for iid, tgt in known.items() if iid in present_ids}
+        lossy_token = _render_lossy_token(known)
+        if lossy_token:
+            pre_tok = _token_bytes(skeleton)
+            cand, ok = _upsert_program_used(skeleton, lossy_token)
+            if ok:
+                skeleton, legacy_bytes = _strip_legacy_marks(cand)
+                old_ann = pre_tok + legacy_bytes
+                new_ann = len(lossy_token)
+            else:
+                # No document-info to host a token (book already broken):
+                # fall back to tag stamps so the wins stay protected.
+                print("[warning] cannot place lossy token, "
+                      "stamping tags instead", file=sys.stderr)
+                for img in images:
+                    if img.idx in mark_set:
+                        skeleton = _patch_binary_attrs(
+                            skeleton, img.img_id,
+                            _set_lossy_mark(real_attrs[img.idx], lossy))
+        else:
+            old_ann = _token_bytes(skeleton)
+            try:
+                skeleton = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", skeleton)
+            except Exception:
+                pass
+    stats.marks = old_ann - new_ann
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
         new_skeleton = new_skeleton.replace(f"__FB2OPT_{token}_{img.idx}__",
@@ -1102,7 +1301,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     total_delta = len(payload) - len(new_payload)
     img_delta = stats.png_saved + stats.jpg_saved + stats.other_saved
-    stats.xml_saved = total_delta - img_delta
+    stats.xml_saved = total_delta - img_delta - stats.marks
     return new_payload, stats
 
 

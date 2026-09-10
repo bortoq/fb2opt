@@ -104,10 +104,14 @@ file itself and guarded by a metric — nothing is taken on faith.
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
   refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
-- No silent re-lossy: images `--lossy` compresses get an `fb2opt-lossy`
-  stamp with the applied target. A re-run skips stamped images (only
+- No silent re-lossy: images `--lossy` compresses are recorded in the
+  `<program-used>` field as `fb2opt-lossy[0.92:id1,id2]` (schema-valid,
+  unlike a tag attribute). A re-run skips stamped images (only
   a strictly lower target re-opens them), so quality never ratchets
-  down run after run.
+  down run after run. Old-style tag stamps migrate there on the next
+  `--lossy` run. The `marks:` entry in the result line is the stamp
+  overhead in bytes (usually negative and tiny — e.g. 19 stamps show
+  as `xml: -380` without it); `xml` itself stays honest.
 - Presets (measured on painterly cover scans): `0.99` (conservative,
   safe everywhere) ≈ −10 % over lossless; `0.95` (balanced);
   `0.92` (default: ≈ −70 % on covers, SSIM ≈ 0.93 / PSNR ≈ 30 dB —
