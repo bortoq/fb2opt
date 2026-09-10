@@ -77,19 +77,36 @@ the unpacked FB2 delta.
 
 ## Lossy mode (`--lossy`)
 
-Opt-in: images are recompressed with losses when it pays off.
+Opt-in: images are recompressed with losses when it pays off. The program
+knows nothing about a book's origin, so every decision is made from the
+file itself and guarded by a metric — nothing is taken on faith.
 
-- JPEG: quality ladder 60→95 (progressive, original chroma subsampling
-  kept); PNG: palette ladder 64→128→192 colors (no alpha images).
-- Each candidate is scored against the original with **SSIM via ffmpeg**;
-  the first candidate with SSIM ≥ threshold wins (default 0.99,
-  `--lossy-ssim` overrides). Quality choice is *not* monotonic under
-  re-compression, so the ladder is walked upward instead of bisecting.
+- **Format crossover.** A photo stored as PNG is tried as JPEG; a flat
+  graphic stored as JPEG is tried as PNG. Native format goes first and
+  the crossover runs only if it didn't win (speed + fewer surprises).
+- **Downscale.** Anything larger than 1920 px on the long side is
+  resampled (Lanczos) — reader screens end there. The metric compares
+  against the downscaled original, i.e. what the reader would show.
+- **Gray.** Exactly-gray RGB goes L directly; near-gray images get one
+  extra L-mode probe at the winning quality (chroma costs bytes).
+- **Quality ladders.** JPEG 60→95 (progressive, source chroma subsampling
+  kept when the source is a JPEG); PNG palette 64→128→192 (no alpha
+  images). Each candidate is scored against the original with **SSIM via
+  ffmpeg**; the first candidate with SSIM ≥ threshold wins (default 0.99,
+  `--lossy-ssim` overrides). Ladders walk upward instead of bisecting
+  because quality is *not* monotonic under re-compression. SSIM (not
+  Butteraugli) is a deliberate trade-off: ~25 ms per check keeps a book
+  in the seconds-to-minutes range; the 0.99 default stays conservative.
 - The winner is squeezed losslessly (`ect`, same as above) and kept
   **only if strictly smaller** than the lossless result — otherwise
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
   refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
+
+Even the default lossless mode re-encodes when it can prove
+pixel-identity: exact gray → L, palette slack trim, RGB→palette,
+few-color JPEG → PNG. A format change rewrites the `content-type`
+of the `<binary>` block, so the markup stays honest.
 
 ## Text safety
 

@@ -34,9 +34,11 @@ import zipfile
 from dataclasses import dataclass, field
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageStat
 except ImportError:  # optional: only needed for --lossy
     Image = None
+    ImageChops = None
+    ImageStat = None
 
 
 # --------------------------------------------------------------------------
@@ -68,7 +70,14 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.2"
+VERSION = "4.3"
+
+# Smart image heuristics (real-world files of unknown origin).
+LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
+LOSSY_MIN_BYTES = 2048  # skip the metric search on tiny images (not worth it)
+LOSSY_PNG_MAX_PX = 2000000  # JPEG->PNG crossover bound (keeps ect -9 fast)
+GRAY_PROBE_SCORE = 6.0  # below this mean chroma: one extra L-mode probe
+ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try  # below this mean chroma: one extra L-mode probe
 
 LOSSY_DEFAULT_SSIM = 0.99
 
@@ -312,7 +321,7 @@ def short_hint() -> str:
         "Usage:\n"
         "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
         "  fb2opt -r LIBRARY [...]           walk folders, optimize every .fb2.zip\n"
-        "  fb2opt --lossy BOOK [...]           lossy PNG/JPEG (needs Pillow+ffmpeg)\n"
+        "  fb2opt --lossy BOOK [...]         lossy PNG/JPEG (needs Pillow+ffmpeg)\n"
         "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
         "  fb2opt --extract SRC [--dir OUT]  pull images (SRC: file or folder)\n"
         "  fb2opt --pack BOOK.fb2 [--dir D]  put images from folder D into the book\n"
@@ -373,10 +382,7 @@ def optimize_images(images: list[_Image], workdir: str,
             except OSError:
                 result[img.idx] = img.raw
                 continue
-            if img.kind == "png":
-                run_tool(["ect", "-9", tmp])
-            else:
-                run_tool(["ect", "-9", "-strip", "-progressive", tmp])
+            _ect_squeeze(tmp, img.kind)
             try:
                 with open(tmp, "rb") as fh:
                     optimized = fh.read()
@@ -394,10 +400,126 @@ def optimize_images(images: list[_Image], workdir: str,
                 os.unlink(tmp)
             except OSError:
                 pass
+        if Image is not None:
+            base = _try_lossless_variants(img, workdir, base, have_ect)
         if lossy is not None and _lossy_tools_ok():
             base = _try_lossy(img, workdir, lossy, base)
         result[img.idx] = base
     return result
+
+
+# --------------------------------------------------------------------------
+# Smart image heuristics: what the file itself tells us
+# --------------------------------------------------------------------------
+
+def _pixels_equal(a: bytes, b: bytes) -> bool:
+    """Same decoded size and RGB pixels. The lossless-verdict primitive."""
+    ia, ib = _pil_open(a), _pil_open(b)
+    if ia is None or ib is None:
+        return False
+    if tuple(ia.size) != tuple(ib.size):
+        return False
+    try:
+        diff = ImageChops.difference(ia.convert("RGB"), ib.convert("RGB"))
+        return diff.getbbox() is None
+    except Exception:
+        return False
+
+
+def _has_alpha(im) -> bool:
+    """Any transparency channel or palette transparency."""
+    if im is None or Image is None:
+        return True  # unknown: stay conservative
+    try:
+        if "A" in im.getbands():
+            return True
+        return im.info.get("transparency") is not None
+    except Exception:
+        return True
+
+
+def _is_exact_gray(im) -> bool:
+    """RGB pixels are exactly gray (R == G == B everywhere)."""
+    if im is None or Image is None:
+        return False
+    try:
+        if im.mode == "L":
+            return True
+        if im.mode != "RGB":
+            return False
+        back = im.convert("L").convert("RGB")
+        return ImageChops.difference(im, back).getbbox() is None
+    except Exception:
+        return False
+
+
+def _gray_score(im) -> float:
+    """Mean per-pixel chroma energy (0 = gray). One extra L-mode probe."""
+    if im is None or Image is None:
+        return float("inf")
+    try:
+        tiny = im.convert("RGB").resize((32, 32))
+        cb, cr = tiny.convert("YCbCr").split()[1:]
+        flat = Image.new("L", cb.size, 128)
+        return (ImageStat.Stat(ImageChops.difference(cb, flat)).mean[0]
+                + ImageStat.Stat(ImageChops.difference(cr, flat)).mean[0])
+    except Exception:
+        return float("inf")
+
+
+def _distinct_colors(im, limit: int = 257) -> int | None:
+    """Distinct RGB colors up to limit; None when more (early exit)."""
+    if im is None or Image is None:
+        return None
+    try:
+        cols = im.convert("RGB").getcolors(maxcolors=limit)
+    except Exception:
+        return None
+    return None if cols is None else len(cols)
+
+
+def _scale_pair(im):
+    """(work, ref): work downscaled to LOSSY_MAX_SIDE if huge, ref its RGB."""
+    if im is None or Image is None:
+        return None, None
+    try:
+        w, h = im.size
+        m = max(w, h)
+        work = im if m <= LOSSY_MAX_SIDE else im.resize(
+            (max(1, round(w * LOSSY_MAX_SIDE / m)),
+             max(1, round(h * LOSSY_MAX_SIDE / m))), Image.LANCZOS)
+        if work.mode not in ("RGB", "L"):
+            work = work.convert("RGB")
+        return work, work.convert("RGB")
+    except Exception:
+        return None, None
+
+
+def _set_content_type(attrs: str, kind: str) -> str:
+    """Rewrite (or add) the content-type to match the new image format."""
+    mime = "image/png" if kind == "png" else "image/jpeg"
+    try:
+        new_attrs, n = re.subn(r'content-type\s*=\s*["\'][^"\']*["\']',
+                               f'content-type="{mime}"', attrs or "",
+                               count=1, flags=re.IGNORECASE)
+    except Exception:
+        return attrs
+    if n:
+        return new_attrs
+    return attrs + ' content-type="' + mime + '"'
+
+
+def _patch_binary_attrs(text: str, img_id: str, new_attrs: str) -> str:
+    """Swap the <binary> tag of one id (format change keeps markup honest)."""
+    if not text or not img_id or not new_attrs:
+        return text
+    try:
+        pat = re.compile(r"<binary\b([^>]*\bid\s*=\s*[\"']"
+                         + re.escape(img_id) + r"[\"'][^>]*)>",
+                         re.IGNORECASE)
+        return pat.sub(f"<binary{new_attrs}>", text, count=1)
+    except Exception:
+        return text
 
 
 # --------------------------------------------------------------------------
@@ -411,6 +533,109 @@ def optimize_images(images: list[_Image], workdir: str,
 LOSSY_JPEG_LADDER = (60, 65, 70, 75, 80, 85, 90, 95)
 LOSSY_PNG_LADDER = (64, 128, 192)
 SSIM_TIMEOUT = 120
+
+
+def _ect_squeeze(path: str, kind: str) -> None:
+    """One lossless ect pass for the image kind. Never raises."""
+    if kind == "png":
+        run_tool(["ect", "-9", path])
+    else:
+        run_tool(["ect", "-9", "-strip", "-progressive", path])
+
+
+def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
+                           have_ect: bool) -> bytes:
+    """Pixel-exact re-encodings: gray, palette trim, JPEG->PNG.
+
+    Every candidate is verified identical to the source pixels and kept
+    only when strictly smaller (after its own ect pass). Never raises.
+    """
+    if not base or Image is None or not img.raw:
+        return base
+    try:
+        im = _pil_open(img.raw)
+    except Exception:
+        return base
+    if im is None or _has_alpha(im):
+        return base
+    cands: list[tuple[bytes, str]] = []
+    try:
+        if img.kind == "png":
+            if im.mode == "RGB" and _is_exact_gray(im):
+                buf = io.BytesIO()
+                im.convert("L").save(buf, "PNG", optimize=True)
+                if _pixels_equal(buf.getvalue(), img.raw):
+                    cands.append((buf.getvalue(), "png"))
+            if im.mode == "RGB":
+                n = _distinct_colors(im)
+                if n is not None and 1 <= n <= 256:
+                    q = im.quantize(colors=max(n, 2),
+                                    method=Image.MEDIANCUT,
+                                    dither=Image.Dither.NONE)
+                    buf = io.BytesIO()
+                    q.save(buf, "PNG", optimize=True)
+                    if _pixels_equal(buf.getvalue(), img.raw):
+                        cands.append((buf.getvalue(), "png"))
+            if im.mode == "P":
+                try:
+                    pal_size = len(im.getpalette()) // 3
+                except (TypeError, AttributeError):
+                    pal_size = 256
+                n = _distinct_colors(im)
+                if n is not None and 1 <= n < pal_size:
+                    q = im.convert("RGB").quantize(
+                        colors=max(n, 2), method=Image.MEDIANCUT,
+                        dither=Image.Dither.NONE)
+                    buf = io.BytesIO()
+                    q.save(buf, "PNG", optimize=True)
+                    if _pixels_equal(buf.getvalue(), img.raw):
+                        cands.append((buf.getvalue(), "png"))
+        elif img.kind == "jpg":
+            if im.mode in ("RGB", "L", "P"):
+                w, h = im.size
+                if w * h <= LOSSY_PNG_MAX_PX:
+                    # JPEG ringing around flat graphics pushes the count
+                    # into the hundreds; photos have orders of magnitude more.
+                    n = _distinct_colors(im, limit=4097)
+                    if n is not None and 1 <= n <= 4096:
+                        work = im.convert("RGB")
+                        buf = io.BytesIO()
+                        work.save(buf, "PNG", optimize=True)
+                        if _pixels_equal(buf.getvalue(), img.raw):
+                            cands.append((buf.getvalue(), "png"))
+    except Exception:
+        return base
+    for cb, ck in cands:
+        # PIL zlib is weak on PNG: a small candidate may still win after ect.
+        if not cb or (len(cb) >= len(base) and not (
+                ck == "png" and have_ect and len(cb) < ECT_FAST_BYTES)):
+            continue
+        if have_ect:
+            tmp = os.path.join(workdir, "exact_%04d.%s" % (img.idx, ck))
+            try:
+                with open(tmp, "wb") as fh:
+                    fh.write(cb)
+            except OSError:
+                continue
+            try:
+                _ect_squeeze(tmp, ck)
+                try:
+                    with open(tmp, "rb") as fh:
+                        eco = fh.read()
+                except OSError:
+                    continue
+                if (0 < len(eco) < len(base)
+                        and _looks_complete(ck, eco)
+                        and _pixels_equal(eco, img.raw)):
+                    base = eco
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        else:
+            base = cb
+    return base
 
 
 def _pil_open(raw: bytes):
@@ -467,14 +692,14 @@ def _drop_paths(paths: list[str]) -> None:
             pass
 
 
-def _lossy_jpeg(im, img: _Image, workdir: str, target: float
-                ) -> tuple[bytes, tuple[int, int]] | None:
-    """Cheapest JPEG quality with SSIM >= target. None — nothing qualifies."""
-    if im.mode not in ("RGB", "L", "P"):
-        return None  # CMYK / alpha / exotic: keep lossless
-    work = im if im.mode in ("RGB", "L") else im.convert("RGB")
-    ref = im.convert("RGB")
-    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
+def _jpeg_ladder(work, ref, stem: str, target: float,
+                 gray_probe: bool = False) -> tuple[bytes, int] | None:
+    """Cheapest JPEG quality with SSIM >= target. (bytes, quality) or None."""
+    if Image is None or work is None or ref is None:
+        return None
+    # 'keep' preserves the source chroma subsampling, but only a JPEG
+    # source has one; anything else (PNG, resized) uses the default.
+    keep_sampling = getattr(work, "format", None) == "JPEG"
     tmps: list[str] = []
     try:
         ref_path = stem + "_ref.png"
@@ -482,9 +707,12 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float
         tmps.append(ref_path)
         for q in LOSSY_JPEG_LADDER:
             cand_jpg = stem + "_c.jpg"
-            # 'keep' preserves the original chroma subsampling.
-            work.save(cand_jpg, "JPEG", quality=q, progressive=True,
-                      optimize=True, subsampling="keep")
+            if keep_sampling:
+                work.save(cand_jpg, "JPEG", quality=q, progressive=True,
+                          optimize=True, subsampling="keep")
+            else:
+                work.save(cand_jpg, "JPEG", quality=q, progressive=True,
+                          optimize=True)
             tmps.append(cand_jpg)
             try:
                 with open(cand_jpg, "rb") as fh:
@@ -499,7 +727,12 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float
             tmps.append(cand_png)
             score = _ssim_score(ref_path, cand_png)
             if score is not None and score >= target:
-                return jb, tuple(ref.size)
+                if gray_probe and work.mode == "RGB":
+                    probe = _gray_probe_at(work, ref_path, ref.size, stem,
+                                           q, target, tmps)
+                    if probe is not None and len(probe) < len(jb):
+                        return probe, q
+                return jb, q
         return None
     except (OSError, ValueError):
         return None
@@ -507,36 +740,102 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float
         _drop_paths(tmps)
 
 
-def _lossy_png(im, img: _Image, workdir: str, target: float
+def _gray_probe_at(work, ref_path: str, ref_size, stem: str, q: int,
+                   target: float, tmps: list) -> bytes | None:
+    """One L-mode encode at the winning quality (near-gray images only)."""
+    try:
+        probe_jpg = stem + "_g.jpg"
+        if getattr(work, "format", None) == "JPEG":
+            work.convert("L").save(probe_jpg, "JPEG", quality=q,
+                                   progressive=True, optimize=True,
+                                   subsampling="keep")
+        else:
+            work.convert("L").save(probe_jpg, "JPEG", quality=q,
+                                   progressive=True, optimize=True)
+        tmps.append(probe_jpg)
+        with open(probe_jpg, "rb") as fh:
+            lb = fh.read()
+        dec = _pil_open(lb)
+        if dec is None or tuple(dec.size) != tuple(ref_size):
+            return None
+        probe_png = stem + "_g.png"
+        dec.convert("RGB").save(probe_png)
+        tmps.append(probe_png)
+        score = _ssim_score(ref_path, probe_png)
+        if score is not None and score >= target:
+            return lb
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def _lossy_jpeg(im, img: _Image, workdir: str, target: float,
+                allow_cross: bool = True, base_len: int | None = None
+                ) -> tuple[bytes, tuple[int, int]] | None:
+    """JPEG ladder (+L handling); PNG crossover when native doesn't win."""
+    if im is None or Image is None:
+        return None
+    if im.mode not in ("RGB", "L", "P"):
+        return None  # CMYK / alpha / exotic: keep lossless
+    work, ref = _scale_pair(im)
+    if work is None or ref is None:
+        return None
+    stem = os.path.join(workdir, "lossy_%04d" % img.idx)
+    if _is_exact_gray(work):
+        w2 = work if work.mode == "L" else work.convert("L")
+        hit = _jpeg_ladder(w2, ref, stem, target, False)
+    else:
+        if work.mode not in ("RGB", "L"):
+            work = work.convert("RGB")
+        hit = _jpeg_ladder(work, ref, stem, target,
+                           work.mode == "RGB"
+                           and _gray_score(work) < GRAY_PROBE_SCORE)
+    best = None
+    if hit is not None:
+        best = (hit[0], tuple(ref.size))
+    if allow_cross and (best is None or (base_len is not None
+                                         and len(best[0]) >= base_len)):
+        cross = _lossy_png(work, img, workdir, target, False, base_len)
+        if cross is not None and (best is None
+                                  or len(cross[0]) < len(best[0])):
+            best = cross
+    return best
+
+
+def _lossy_png(im, img: _Image, workdir: str, target: float,
+               allow_cross: bool = True, base_len: int | None = None
                ) -> tuple[bytes, tuple[int, int]] | None:
-    """Cheapest palette size with SSIM >= target. None — nothing qualifies."""
-    if "A" in im.getbands():
+    """Palette ladder first; JPEG crossover when native doesn't win."""
+    if im is None or Image is None:
+        return None
+    if _has_alpha(im):
         return None  # transparency must survive byte-exact: keep lossless
     if im.mode not in ("RGB", "L", "P"):
         return None
-    if im.mode == "P":
-        if im.info.get("transparency") is not None:
-            return None
+    work, ref = _scale_pair(im)
+    if work is None or ref is None:
+        return None
+    if work.mode == "P":
         try:
-            palette_size = len(im.getpalette()) // 3
+            pal_size = len(work.getpalette()) // 3
         except (TypeError, AttributeError):
-            palette_size = 256
+            pal_size = 256
     else:
-        palette_size = 1 << 24
-    ref = im.convert("RGB")
-    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
+        pal_size = 1 << 24
+    stem = os.path.join(workdir, "lossy_%04d" % img.idx)
     tmps: list[str] = []
+    best = None
     try:
         ref_path = stem + "_ref.png"
         ref.save(ref_path)
         tmps.append(ref_path)
         for n in LOSSY_PNG_LADDER:
-            if palette_size <= n:
+            if pal_size <= n:
                 continue  # nothing to quantize away
             cand_png = stem + "_c.png"
-            im.convert("RGB").quantize(colors=n, method=Image.MEDIANCUT,
-                                       dither=Image.Dither.NONE).save(
-                                           cand_png, "PNG", optimize=True)
+            work.convert("RGB").quantize(colors=n, method=Image.MEDIANCUT,
+                                         dither=Image.Dither.NONE).save(
+                                             cand_png, "PNG", optimize=True)
             tmps.append(cand_png)
             try:
                 with open(cand_png, "rb") as fh:
@@ -548,15 +847,23 @@ def _lossy_png(im, img: _Image, workdir: str, target: float
                 continue
             score = _ssim_score(ref_path, cand_png)
             if score is not None and score >= target:
-                return pb, tuple(ref.size)
-        return None
+                best = (pb, tuple(ref.size))
+                break
     except (OSError, ValueError):
-        return None
+        best = None
     finally:
         _drop_paths(tmps)
+    if allow_cross and (best is None or (base_len is not None
+                                         and len(best[0]) >= base_len)):
+        cross = _lossy_jpeg(work, img, workdir, target, False, base_len)
+        if cross is not None and (best is None
+                                  or len(cross[0]) < len(best[0])):
+            best = cross
+    return best
 
 
-def _lossy_variant(img: _Image, workdir: str, target: float
+def _lossy_variant(img: _Image, workdir: str, target: float,
+                   base_len: int | None = None
                    ) -> tuple[bytes, tuple[int, int]] | None:
     """Metric-gated lossy bytes for one image. None — keep the lossless path."""
     if Image is None or not have_ffmpeg() or not img.raw:
@@ -565,34 +872,35 @@ def _lossy_variant(img: _Image, workdir: str, target: float
     if im is None:
         return None
     if img.kind == "jpg":
-        return _lossy_jpeg(im, img, workdir, target)
+        return _lossy_jpeg(im, img, workdir, target, True, base_len)
     if img.kind == "png":
-        return _lossy_png(im, img, workdir, target)
+        return _lossy_png(im, img, workdir, target, True, base_len)
     return None
 
 
 def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
     """Replace base with a lossy variant only when strictly smaller and valid."""
-    if not base:
+    if not base or len(img.raw) < LOSSY_MIN_BYTES:
         return base
-    variant = _lossy_variant(img, workdir, target)
+    variant = _lossy_variant(img, workdir, target, len(base))
     if variant is None:
         return base
     vbytes, vsize = variant
-    if not 0 < len(vbytes) < len(base):
+    if not vbytes.startswith((PNG_MAGIC, JPEG_MAGIC)):
+        return base
+    vkind = "png" if vbytes.startswith(PNG_MAGIC) else "jpg"
+    if not 0 < len(vbytes) < len(base) and not (
+            vkind == "png" and len(vbytes) < ECT_FAST_BYTES):
         return base
     # Squeeze the lossy bytes through the same lossless pass.
-    ltmp = os.path.join(workdir, f"lossy_{img.idx:04d}.{img.kind}")
+    ltmp = os.path.join(workdir, "lossy_%04d.%s" % (img.idx, vkind))
     try:
         with open(ltmp, "wb") as fh:
             fh.write(vbytes)
     except OSError:
         return base
     try:
-        if img.kind == "png":
-            run_tool(["ect", "-9", ltmp])
-        else:
-            run_tool(["ect", "-9", "-strip", "-progressive", ltmp])
+        _ect_squeeze(ltmp, vkind)
         try:
             with open(ltmp, "rb") as fh:
                 eco = fh.read()
@@ -600,7 +908,7 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
             return base
         if not 0 < len(eco) < len(base):
             return base
-        if not _looks_complete(img.kind, eco):
+        if not _looks_complete(vkind, eco):
             return base
         if not _same_dims(eco, vsize):
             return base
@@ -612,7 +920,6 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
             pass
 
 
-# --------------------------------------------------------------------------
 # Optimizing one FB2 document (in memory)
 # --------------------------------------------------------------------------
 
@@ -662,6 +969,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     stats = Fb2Stats(pics=len(images), skipped=skipped)
     blocks: dict[int, str] = {}
+    skeleton_late: list[tuple[str, str, str]] = []
     for img in images:
         final = optimized.get(img.idx, img.raw)
         if final == img.raw:
@@ -671,6 +979,9 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
             continue
         new_body = encode_body(final)
         blocks[img.idx] = new_body
+        final_kind = detect_kind(final, "")
+        if final_kind in ("png", "jpg") and final_kind != img.kind:
+            skeleton_late.append((img.img_id, img.attrs, final_kind))
         delta = img.orig_b64_len - len(new_body)
         if img.kind == "png":
             stats.png_saved += delta
@@ -679,6 +990,9 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         else:
             stats.other_saved += delta
 
+    for img_id, attrs, kind in skeleton_late:
+        skeleton = _patch_binary_attrs(skeleton, img_id,
+                                       _set_content_type(attrs, kind))
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
         new_skeleton = new_skeleton.replace(f"__FB2OPT_{token}_{img.idx}__",

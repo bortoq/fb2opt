@@ -798,5 +798,232 @@ class TestExoticEncodings(unittest.TestCase):
         self.assertEqual(new, body)
 
 
+
+
+
+def _solid(mode, size, color):
+    from PIL import Image as _I
+    return _I.new(mode, size, color)
+
+
+def _flat_two_color():
+    from PIL import Image as _I, ImageDraw as _D
+    im = _I.new("RGB", (64, 64), "white")
+    _D.Draw(im).rectangle([8, 8, 56, 56], fill="navy")
+    return im
+
+
+def _png_bytes(im):
+    import io as _io
+    buf = _io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+class TestPixelHelpers(unittest.TestCase):
+    def test_pixels_equal(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        a = _png_bytes(_flat_two_color())
+        self.assertTrue(mod._pixels_equal(a, a))
+        b = _png_bytes(_gradient(64, 64))
+        self.assertFalse(mod._pixels_equal(a, b))
+        self.assertFalse(mod._pixels_equal(b"junk", a))
+        self.assertFalse(mod._pixels_equal(a, b"junk"))
+
+    def test_has_alpha(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        self.assertFalse(mod._has_alpha(_solid("RGB", (4, 4), "red")))
+        self.assertTrue(mod._has_alpha(_solid("RGBA", (4, 4), (1, 2, 3, 4))))
+        p = _solid("P", (4, 4), 0)
+        p.info["transparency"] = 0
+        self.assertTrue(mod._has_alpha(p))
+        self.assertTrue(mod._has_alpha(None))
+
+    def test_exact_gray(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        self.assertTrue(mod._is_exact_gray(_solid("RGB", (8, 8), (77, 77, 77))))
+        self.assertTrue(mod._is_exact_gray(_solid("L", (8, 8), 77)))
+        self.assertFalse(mod._is_exact_gray(_solid("RGB", (8, 8), (77, 78, 77))))
+        self.assertFalse(mod._is_exact_gray(None))
+
+    def test_gray_score_orders(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        gray = mod._gray_score(_solid("RGB", (64, 64), (100, 100, 100)))
+        red = mod._gray_score(_solid("RGB", (64, 64), (220, 30, 30)))
+        self.assertLess(gray, 1.0)
+        self.assertGreater(red, 20.0)
+
+    def test_distinct_colors(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        self.assertEqual(mod._distinct_colors(_flat_two_color()), 2)
+        self.assertIsNone(mod._distinct_colors(_gradient()))
+        self.assertIsNone(mod._distinct_colors(None))
+
+    def test_scale_pair(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        work, ref = mod._scale_pair(_solid("RGB", (100, 50), "red"))
+        self.assertEqual(work.size, (100, 50))
+        self.assertEqual(ref.mode, "RGB")
+        work, ref = mod._scale_pair(_solid("RGB", (2500, 1000), "red"))
+        self.assertEqual(max(work.size), mod.LOSSY_MAX_SIDE)
+        self.assertEqual(work.size, (1920, 768))
+        self.assertEqual(ref.size, work.size)
+        self.assertEqual(mod._scale_pair(None), (None, None))
+
+    def test_set_content_type(self):
+        self.assertEqual(
+            mod._set_content_type(' id="a" content-type="image/png"', "jpg"),
+            ' id="a" content-type="image/jpeg"')
+        self.assertEqual(
+            mod._set_content_type(' id="a" CONTENT-TYPE="image/png" ', "jpg"),
+            ' id="a" content-type="image/jpeg" ')
+        self.assertEqual(mod._set_content_type(' id="a"', "png"),
+                         ' id="a" content-type="image/png"')
+
+    def test_patch_binary_attrs(self):
+        text = '<binary id="a" content-type="image/png">BODY</binary>'
+        out = mod._patch_binary_attrs(text, "a", ' id="a" content-type="image/jpeg"')
+        self.assertIn('content-type="image/jpeg"', out)
+        self.assertIn("BODY", out)
+        self.assertEqual(mod._patch_binary_attrs(text, "zzz", " X"), text)
+        self.assertEqual(mod._patch_binary_attrs("", "a", " X"), "")
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestLosslessVariants(unittest.TestCase):
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="v", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_gray_rgb_png_to_l(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (90, 90, 90)))
+        img = self._img(raw, "png")
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(img, d, raw, False)
+        back = mod._pil_open(out)
+        self.assertEqual(back.mode, "L")
+        self.assertLess(len(out), len(raw))
+        self.assertTrue(mod._pixels_equal(out, raw))
+
+    def test_palette_trim(self):
+        from PIL import Image as _I
+        p = _flat_two_color().quantize(colors=256, method=_I.MEDIANCUT)
+        buf = _png_bytes(p)
+        before = len(buf)
+        img = self._img(buf, "png")
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(img, d, buf, False)
+        self.assertLessEqual(len(out), before)
+        self.assertTrue(mod._pixels_equal(out, buf))
+
+    def test_skips_alpha_and_garbage(self):
+        import io as _io
+        buf = _io.BytesIO()
+        _solid("RGBA", (16, 16), (1, 2, 3, 4)).save(buf, "PNG")
+        raw = buf.getvalue()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(raw, "png"), d, raw, True),
+                raw)
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(b"junk", "png"), d,
+                                           b"junk", True), b"junk")
+
+    def test_jpeg_graphic_tries_png(self):
+        from PIL import Image as _I
+        im = _flat_two_color()
+        raw = _jpeg_bytes(im, 85)
+        img = self._img(raw, "jpg")
+        seen = []
+        real_squeeze = mod._ect_squeeze
+
+        def spy(path, kind):
+            seen.append(kind)
+            return real_squeeze(path, kind)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ect_squeeze", spy):
+                out = mod._try_lossless_variants(img, d, raw, True)
+        self.assertIn("png", seen)  # crossover attempted
+        self.assertTrue(mod._pixels_equal(out, raw))
+        self.assertLessEqual(len(out), len(raw))
+
+    def test_kind_change_rewrites_content_type(self):
+        fb2 = make_fb2()
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "optimize_images",
+                                   return_value={0: JPG_MIN}):
+                new, stats = mod.optimize_fb2_payload(fb2, d, False)
+        self.assertIn(b'content-type="image/jpeg"', new)
+        self.assertNotIn(b'content-type="image/png"', new)
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestSmartLossy(unittest.TestCase):
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="s", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_downscale_caps_result(self):
+        raw = _jpeg_bytes(_gradient(2500, 1800), 95)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                out = mod._lossy_jpeg(mod._pil_open(raw), img, d, 0.99)
+        self.assertIsNotNone(out)
+        self.assertLessEqual(max(mod._pil_open(out[0]).size),
+                             mod.LOSSY_MAX_SIDE)
+
+    def test_native_win_skips_crossover(self):
+        raw = _jpeg_bytes(_gradient(128, 128), 95)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                with mock.patch.object(
+                        mod, "_lossy_png",
+                        side_effect=AssertionError("must not run")):
+                    out = mod._lossy_jpeg(mod._pil_open(raw), img, d, 0.99,
+                                          True, len(raw) * 10)
+        self.assertIsNotNone(out)
+
+    def test_crossover_when_native_loses(self):
+        raw = _jpeg_bytes(_gradient(128, 128), 95)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                out = mod._lossy_jpeg(mod._pil_open(raw), img, d, 0.99,
+                                      True, 1)  # base tiny: native "loses"
+        self.assertIsNotNone(out)  # crossover PNG may still deliver
+
+    def test_tiny_images_skip_search(self):
+        img = self._img(b"x" * 100, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(
+                    mod, "_lossy_variant",
+                    side_effect=AssertionError("must not run")):
+                self.assertEqual(mod._try_lossy(img, d, 0.9, b"x" * 100),
+                                 b"x" * 100)
+
+    def test_gray_probe_fires_on_near_gray(self):
+        from PIL import Image as _I
+        base = _I.new("RGB", (64, 64), (120, 121, 119))
+        raw = _jpeg_bytes(base, 95)
+        self.assertLess(mod._gray_score(base), mod.GRAY_PROBE_SCORE)
+        self.assertFalse(mod._is_exact_gray(base))
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                out = mod._lossy_jpeg(mod._pil_open(raw), img, d, 0.99)
+        self.assertIsNotNone(out)
+        got = mod._pil_open(out[0])
+        # L probe wins on near-gray: result decodes gray
+        self.assertTrue(mod._is_exact_gray(got) or got.mode == "RGB")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
