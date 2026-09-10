@@ -79,7 +79,7 @@ LOSSY_PNG_MAX_PX = 2000000  # JPEG->PNG crossover bound (keeps ect -9 fast)
 GRAY_PROBE_SCORE = 6.0  # below this mean chroma: one extra L-mode probe
 ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try  # below this mean chroma: one extra L-mode probe
 
-LOSSY_DEFAULT_SSIM = 0.99
+LOSSY_DEFAULT_SSIM = 0.92
 
 
 class Fb2OptError(Exception):
@@ -317,16 +317,14 @@ def format_deps() -> str:
 def short_hint() -> str:
     """Short hint for a run with no arguments."""
     return (
-        "fb2opt — lossless optimization of FB2 books (.fb2.zip).\n"
+        "fb2opt — optimization of FB2 books (.fb2.zip).\n"
         "Usage:\n"
-        "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
-        "  fb2opt -r LIBRARY [...]           walk folders, optimize every .fb2.zip\n"
-        "  fb2opt --lossy BOOK [...]         lossy PNG/JPEG (needs Pillow+ffmpeg)\n"
-        "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
-        "  fb2opt --extract SRC [--dir OUT]  pull images (SRC: file or folder)\n"
-        "  fb2opt --pack BOOK.fb2 [--dir D]  put images from folder D into the book\n"
-        "  fb2opt --deps                     dependency status only\n"
-        "  fb2opt --version                  show version\n"
+        "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller\n"
+        "  fb2opt --lossy ...                same, images also lossy (needs Pillow+ffmpeg\n"
+        "  fb2opt -r                         walk current folder (.fb2.zip, nested\n"
+        "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to i\n"
+        "  fb2opt --extract BOOK             pull images into current folde\n"
+        "  fb2opt --pack BOOK.fb2            put images from current folder into the boo\n"
         "  fb2opt -h | --help                full help\n"
         f"{format_deps()}\n"
         "The original is replaced only if (old - new) > 0."
@@ -1605,7 +1603,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         prog="fb2opt",
-        description="Lossless optimization of FB2 books (.fb2.zip). "
+        description="Optimization of FB2 books (.fb2.zip). "
                     "The original is replaced only if the new file is smaller.",
         epilog=format_deps(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1614,15 +1612,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="pull images out of books")
     parser.add_argument("--pack", action="store_true",
                         help="put images from a folder into a book")
-    parser.add_argument("--dir", default="",
-                        help="for --extract: where to pull to (default: cwd); "
-                             "for --pack: where to take images from (default: cwd)")
-    parser.add_argument("--deps", action="store_true",
-                        help="show dependencies and exit")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only")
     parser.add_argument("-r", "--recursive", action="store_true",
-                        help="walk folders and optimize every .fb2.zip inside")
+                        help="walk folders and optimize every .fb2.zip inside "
+                             "(current folder if omitted)")
     parser.add_argument("--lossy", action="store_true",
                         help="recompress PNG/JPEG with losses (needs Pillow+ffmpeg); "
                              "a lossy image is kept only if smaller")
@@ -1630,7 +1624,6 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         metavar="SSIM",
                         help="with --lossy: keep SSIM >= value "
                              f"(default {LOSSY_DEFAULT_SSIM})")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="keep temp files (debugging)")
     return parser.parse_args(argv)
@@ -1639,21 +1632,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Returns the exit code."""
     args = parse_args(argv)
-    if args.deps:
-        print(format_deps())
-        return 0
     if args.extract and args.pack:
         print("[error] --extract and --pack do not mix", file=sys.stderr)
         return 2
     if args.extract:
-        return cmd_extract(args.files, args.dir or os.getcwd(), args.quiet)
+        return cmd_extract(args.files, os.getcwd(), args.quiet)
     if args.pack:
-        return cmd_pack(args.files, args.dir or os.getcwd(), args.quiet)
+        return cmd_pack(args.files, os.getcwd(), args.quiet)
     if not 0.0 < args.lossy_ssim <= 1.0:
         print(f"[error] --lossy-ssim must be within (0, 1], "
               f"got {args.lossy_ssim}", file=sys.stderr)
         return 2
     lossy = args.lossy_ssim if args.lossy else None
+    # Bare -r walks the current folder (nested folders included).
+    if args.recursive and not args.files and not (args.extract or args.pack):
+        args.files = [os.getcwd()]
     # Default mode — optimize. No files: short hint + dependencies.
     if not args.files:
         print(short_hint())

@@ -647,11 +647,57 @@ class TestLossyBatchAndCli(unittest.TestCase):
             self.assertEqual(mod.main(["--lossy-ssim", "0", "x"]), 2)
 
     def test_main_codes(self):
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(mod.main(["--deps"]), 0)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(mod.main(["--extract", "--pack"]), 2)
             self.assertEqual(mod.main([]), 2)
+            for bad in (["--deps"], ["--version"]):
+                with self.assertRaises(SystemExit) as cm:
+                    mod.main(bad)
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_help_shows_deps(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                mod.main(["-h"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("Dependencies", buf.getvalue())
+        self.assertIn("ect", buf.getvalue())
+
+    def test_bare_r_walks_cwd(self):
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            make_zip(os.path.join(d, "b.fb2.zip"), make_fb2())
+            sub = os.path.join(d, "sub")
+            os.makedirs(sub)
+            make_zip(os.path.join(sub, "c.fb2.zip"), make_fb2())
+            old = os.getcwd()
+            os.chdir(d)
+            try:
+                with redirect_stdout(io.StringIO()):
+                    with redirect_stderr(io.StringIO()):
+                        self.assertEqual(mod.main(["-r"]), 0)
+            finally:
+                os.chdir(old)
+            self.assertTrue(os.path.exists(os.path.join(d, "b.fb2.zip")))
+            self.assertTrue(os.path.exists(os.path.join(sub, "c.fb2.zip")))
+
+    def test_lossy_on_zip_book(self):
+        from PIL import Image as _I
+        import io as _io
+        buf = _io.BytesIO()
+        _gradient(200, 200).save(buf, "JPEG", quality=95)
+        raw = buf.getvalue()
+        self.assertGreater(len(raw), mod.LOSSY_MIN_BYTES)
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            zp = os.path.join(d, "book.fb2.zip")
+            make_zip(zp, fb2)
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(mod.main(["--lossy", zp]), 0)
+            self.assertTrue(os.path.exists(zp))
 
     def test_batch_survives_unexpected_exception(self):
         with tempfile.TemporaryDirectory() as d:

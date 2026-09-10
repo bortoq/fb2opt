@@ -1,6 +1,6 @@
 # fb2opt
 
-Lossless optimizer for FB2 books packed as `.fb2.zip`. One Python script, no install needed.
+Optimization of FB2 books packed as `.fb2.zip`. One Python script, no install needed.
 
 What it does:
 
@@ -34,14 +34,12 @@ chmod +x ~/bin/fb2opt
 
 ```sh
 fb2opt BOOK.fb2.zip [BOOK2.fb2.zip ...]   # optimize (replace only if smaller)
-fb2opt --lossy BOOK.fb2.zip [...]         # also recompress PNG/JPEG with losses
-fb2opt -r LIBRARY [...]                   # walk folders, optimize every book
+fb2opt --lossy ...                        # same, images also lossy
+fb2opt -r                                 # walk current folder (nested)
 fb2opt BOOK.fb2 [...]                     # pack raw .fb2 into .fb2.zip next to it
-fb2opt --extract SRC [--dir OUT]          # pull images (SRC: file or folder)
-fb2opt --pack BOOK.fb2 [--dir IMGDIR]     # put images from IMGDIR into the book
-fb2opt --deps                             # show dependencies
-fb2opt --version                          # show version
-fb2opt -h                                 # full help
+fb2opt --extract BOOK                     # pull images into current folder
+fb2opt --pack BOOK.fb2                    # put images from current folder into the book
+fb2opt -h                                 # full help + dependencies
 ```
 
 Result line:
@@ -92,16 +90,23 @@ file itself and guarded by a metric — nothing is taken on faith.
 - **Quality ladders.** JPEG 60→95 (progressive, source chroma subsampling
   kept when the source is a JPEG); PNG palette 64→128→192 (no alpha
   images). Each candidate is scored against the original with **SSIM via
-  ffmpeg**; the first candidate with SSIM ≥ threshold wins (default 0.99,
+  ffmpeg**; the first candidate with SSIM ≥ threshold wins (default 0.92,
   `--lossy-ssim` overrides). Ladders walk upward instead of bisecting
   because quality is *not* monotonic under re-compression. SSIM (not
   Butteraugli) is a deliberate trade-off: ~25 ms per check keeps a book
-  in the seconds-to-minutes range; the 0.99 default stays conservative.
+  in the seconds-to-minutes range; the 0.92 default is tuned for books
+  (see presets below).
 - The winner is squeezed losslessly (`ect`, same as above) and kept
   **only if strictly smaller** than the lossless result — otherwise
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
   refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
+- Presets (measured on painterly cover scans): `0.99` (conservative,
+  safe everywhere) ≈ −10 % over lossless; `0.95` (balanced);
+  `0.92` (default: ≈ −70 % on covers, SSIM ≈ 0.93 / PSNR ≈ 30 dB —
+  smooth gradients show banding on zoom, invisible on e-ink gray).
+  Text scans need higher qualities for the same score — the metric,
+  not a fixed `-m70`, decides per image.
 
 Even the default lossless mode re-encodes when it can prove
 pixel-identity: exact gray → L, palette slack trim, RGB→palette,
