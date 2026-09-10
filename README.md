@@ -4,7 +4,7 @@ Lossless optimizer for FB2 books packed as `.fb2.zip`. One Python script, no ins
 
 What it does:
 
-- recompresses embedded images without quality loss (PNG via `ect`, JPEG via `jpegoptim`);
+- recompresses embedded images without quality loss (`ect`: PNG via `-9`, JPEG via `-9 -strip -progressive`);
 - minifies XML markup (drops comments and extra whitespace);
 - repacks the ZIP at max compression and runs `ect -zip` over it.
 
@@ -17,8 +17,8 @@ a book, `--pack` puts images from a folder back into it.
 ## Requirements
 
 - Python 3 (standard library only).
-- Optional but recommended: `ect` and `jpegoptim`. Without them only
-  XML and ZIP still shrink. Run `fb2opt` with no arguments to see
+- Optional but recommended: `ect`. Without it only XML and ZIP
+  still shrink. Run `fb2opt` with no arguments to see
   what was found.
 
 ## Install
@@ -58,6 +58,9 @@ the unpacked FB2 delta.
 - The tool is lossless by design, but keep backups of books you care about.
 - Originals are replaced only when the new file is smaller; replacement
   is atomic (`os.replace`), so a crash never leaves a half-written book.
+- Temp-file cleanup only ever deletes `fb2opt`'s own `.fb2opt-*.zip`
+  candidates, and after every batch the tool verifies that all inputs
+  are still in place (a missing file is reported as an error).
 - Symlinks are skipped, never followed or replaced.
 - In-place optimization breaks hardlinks (the replaced file gets a new inode).
 - ZIP dates, permissions and comments are preserved. If an archive (or any
