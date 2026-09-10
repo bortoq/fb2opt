@@ -31,14 +31,16 @@ import tempfile
 import time
 import uuid
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 
 try:
-    from PIL import Image, ImageChops, ImageStat
-except ImportError:  # optional: only needed for --lossy
+    from PIL import Image, ImageChops, ImageStat, PngImagePlugin
+except ImportError:  # optional: Pillow tools (lossy + smart lossless)
     Image = None
     ImageChops = None
     ImageStat = None
+    PngImagePlugin = None
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +79,7 @@ LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
 LOSSY_MIN_BYTES = 2048  # skip the metric search on tiny images (not worth it)
 LOSSY_PNG_MAX_PX = 2000000  # JPEG->PNG crossover bound (keeps ect -9 fast)
 GRAY_PROBE_SCORE = 6.0  # below this mean chroma: one extra L-mode probe
-ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try  # below this mean chroma: one extra L-mode probe
+ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try
 
 LOSSY_DEFAULT_SSIM = 0.92
 
@@ -197,6 +199,16 @@ def encode_body(raw: bytes) -> str:
     """Encode image bytes as canonical base64 (76-char lines)."""
     b64 = base64.b64encode(raw).decode("ascii")
     return "\n" + "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)) + "\n"
+
+
+def _packed_cost(raw: bytes) -> int:
+    """Packed size proxy: the exact base64 body under zlib-9 (sub-ms)."""
+    if not raw:
+        return 0
+    try:
+        return len(zlib.compress(encode_body(raw).encode("ascii"), 9))
+    except Exception:
+        return len(raw)
 
 
 def _tag_name(tag: str) -> str:
@@ -386,8 +398,8 @@ def optimize_images(images: list[_Image], workdir: str,
                     optimized = fh.read()
             except OSError:
                 optimized = img.raw
-            # Guard against pessimization: keep the smaller.
-            if 0 < len(optimized) < len(img.raw):
+            # Guard against pessimization: keep the packed-smaller.
+            if 0 < _packed_cost(optimized) < _packed_cost(img.raw):
                 # The optimizer must return a complete image, not a truncated one.
                 if _looks_complete(img.kind, optimized):
                     base = optimized
@@ -560,8 +572,9 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
     try:
         if img.kind == "png":
             if im.mode == "RGB" and _is_exact_gray(im):
+                gray = im.convert("L")
                 buf = io.BytesIO()
-                im.convert("L").save(buf, "PNG", optimize=True)
+                _save_png(gray, buf, meta_from=im)
                 if _pixels_equal(buf.getvalue(), img.raw):
                     cands.append((buf.getvalue(), "png"))
             if im.mode == "RGB":
@@ -571,7 +584,7 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                                     method=Image.MEDIANCUT,
                                     dither=Image.Dither.NONE)
                     buf = io.BytesIO()
-                    q.save(buf, "PNG", optimize=True)
+                    _save_png(q, buf, meta_from=im)
                     if _pixels_equal(buf.getvalue(), img.raw):
                         cands.append((buf.getvalue(), "png"))
             if im.mode == "P":
@@ -585,11 +598,14 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                         colors=max(n, 2), method=Image.MEDIANCUT,
                         dither=Image.Dither.NONE)
                     buf = io.BytesIO()
-                    q.save(buf, "PNG", optimize=True)
+                    _save_png(q, buf, meta_from=im)
                     if _pixels_equal(buf.getvalue(), img.raw):
                         cands.append((buf.getvalue(), "png"))
         elif img.kind == "jpg":
-            if im.mode in ("RGB", "L", "P"):
+            if im.mode in ("RGB", "L", "P") and not im.info.get("exif") \
+                    and not im.info.get("icc_profile"):
+                # No EXIF/ICC: PNG cannot carry them, and EXIF orientation
+                # decides how readers show the file — never flip it silently.
                 w, h = im.size
                 if w * h <= LOSSY_PNG_MAX_PX:
                     # JPEG ringing around flat graphics pushes the count
@@ -598,18 +614,19 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                     if n is not None and 1 <= n <= 4096:
                         work = im.convert("RGB")
                         buf = io.BytesIO()
-                        work.save(buf, "PNG", optimize=True)
+                        _save_png(work, buf, meta_from=im)
                         if _pixels_equal(buf.getvalue(), img.raw):
                             cands.append((buf.getvalue(), "png"))
     except Exception:
         return base
+    base_cost = _packed_cost(base)
     for cb, ck in cands:
         # PIL zlib is weak on PNG: a small candidate may still win after ect.
-        if not cb or (len(cb) >= len(base) and not (
+        if not cb or (_packed_cost(cb) >= base_cost and not (
                 ck == "png" and have_ect and len(cb) < ECT_FAST_BYTES)):
             continue
         if have_ect:
-            tmp = os.path.join(workdir, "exact_%04d.%s" % (img.idx, ck))
+            tmp = os.path.join(workdir, f"exact_{img.idx:04d}.{ck}")
             try:
                 with open(tmp, "wb") as fh:
                     fh.write(cb)
@@ -622,10 +639,11 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                         eco = fh.read()
                 except OSError:
                     continue
-                if (0 < len(eco) < len(base)
+                if (_packed_cost(eco) < base_cost
                         and _looks_complete(ck, eco)
                         and _pixels_equal(eco, img.raw)):
                     base = eco
+                    base_cost = _packed_cost(eco)
             finally:
                 try:
                     os.unlink(tmp)
@@ -633,6 +651,7 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                     pass
         else:
             base = cb
+            base_cost = _packed_cost(cb)
     return base
 
 
@@ -679,6 +698,36 @@ def _ssim_score(ref_png: str, cand_png: str) -> float | None:
             except (ValueError, IndexError):
                 return None
     return None
+
+
+def _save_png(im, path, meta_from=None) -> None:
+    """Save PNG keeping text chunks and ICC profile when present.
+
+    Metadata is taken from meta_from (the source image) when given,
+    else from im itself. Falls back to a plain save on any trouble.
+    """
+    src_im = meta_from if meta_from is not None else im
+    kw: dict = {"optimize": True}
+    if Image is not None and src_im is not None:
+        try:
+            profile = src_im.info.get("icc_profile")
+            if profile:
+                kw["icc_profile"] = profile
+            text = getattr(src_im, "text", None)
+            if text and PngImagePlugin is not None:
+                info = PngImagePlugin.PngInfo()
+                for key, value in text.items():
+                    try:
+                        info.add_text(str(key), str(value))
+                    except Exception:
+                        continue
+                kw["pnginfo"] = info
+        except Exception:
+            pass
+    try:
+        im.save(path, "PNG", **kw)
+    except Exception:
+        im.save(path, "PNG", optimize=True)
 
 
 def _drop_paths(paths: list[str]) -> None:
@@ -768,7 +817,7 @@ def _gray_probe_at(work, ref_path: str, ref_size, stem: str, q: int,
 
 
 def _lossy_jpeg(im, img: _Image, workdir: str, target: float,
-                allow_cross: bool = True, base_len: int | None = None
+                allow_cross: bool = True, base_cost: int | None = None
                 ) -> tuple[bytes, tuple[int, int]] | None:
     """JPEG ladder (+L handling); PNG crossover when native doesn't win."""
     if im is None or Image is None:
@@ -778,7 +827,7 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float,
     work, ref = _scale_pair(im)
     if work is None or ref is None:
         return None
-    stem = os.path.join(workdir, "lossy_%04d" % img.idx)
+    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
     if _is_exact_gray(work):
         w2 = work if work.mode == "L" else work.convert("L")
         hit = _jpeg_ladder(w2, ref, stem, target, False)
@@ -791,9 +840,9 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float,
     best = None
     if hit is not None:
         best = (hit[0], tuple(ref.size))
-    if allow_cross and (best is None or (base_len is not None
-                                         and len(best[0]) >= base_len)):
-        cross = _lossy_png(work, img, workdir, target, False, base_len)
+    if allow_cross and (best is None or (base_cost is not None
+                                         and _packed_cost(best[0]) >= base_cost)):
+        cross = _lossy_png(work, img, workdir, target, False, base_cost)
         if cross is not None and (best is None
                                   or len(cross[0]) < len(best[0])):
             best = cross
@@ -801,7 +850,7 @@ def _lossy_jpeg(im, img: _Image, workdir: str, target: float,
 
 
 def _lossy_png(im, img: _Image, workdir: str, target: float,
-               allow_cross: bool = True, base_len: int | None = None
+               allow_cross: bool = True, base_cost: int | None = None
                ) -> tuple[bytes, tuple[int, int]] | None:
     """Palette ladder first; JPEG crossover when native doesn't win."""
     if im is None or Image is None:
@@ -820,7 +869,7 @@ def _lossy_png(im, img: _Image, workdir: str, target: float,
             pal_size = 256
     else:
         pal_size = 1 << 24
-    stem = os.path.join(workdir, "lossy_%04d" % img.idx)
+    stem = os.path.join(workdir, f"lossy_{img.idx:04d}")
     tmps: list[str] = []
     best = None
     try:
@@ -831,9 +880,9 @@ def _lossy_png(im, img: _Image, workdir: str, target: float,
             if pal_size <= n:
                 continue  # nothing to quantize away
             cand_png = stem + "_c.png"
-            work.convert("RGB").quantize(colors=n, method=Image.MEDIANCUT,
-                                         dither=Image.Dither.NONE).save(
-                                             cand_png, "PNG", optimize=True)
+            quantized = work.convert("RGB").quantize(
+                colors=n, method=Image.MEDIANCUT, dither=Image.Dither.NONE)
+            _save_png(quantized, cand_png, meta_from=im)
             tmps.append(cand_png)
             try:
                 with open(cand_png, "rb") as fh:
@@ -851,9 +900,9 @@ def _lossy_png(im, img: _Image, workdir: str, target: float,
         best = None
     finally:
         _drop_paths(tmps)
-    if allow_cross and (best is None or (base_len is not None
-                                         and len(best[0]) >= base_len)):
-        cross = _lossy_jpeg(work, img, workdir, target, False, base_len)
+    if allow_cross and (best is None or (base_cost is not None
+                                         and _packed_cost(best[0]) >= base_cost)):
+        cross = _lossy_jpeg(work, img, workdir, target, False, base_cost)
         if cross is not None and (best is None
                                   or len(cross[0]) < len(best[0])):
             best = cross
@@ -861,7 +910,7 @@ def _lossy_png(im, img: _Image, workdir: str, target: float,
 
 
 def _lossy_variant(img: _Image, workdir: str, target: float,
-                   base_len: int | None = None
+                   base_cost: int | None = None
                    ) -> tuple[bytes, tuple[int, int]] | None:
     """Metric-gated lossy bytes for one image. None — keep the lossless path."""
     if Image is None or not have_ffmpeg() or not img.raw:
@@ -870,9 +919,9 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
     if im is None:
         return None
     if img.kind == "jpg":
-        return _lossy_jpeg(im, img, workdir, target, True, base_len)
+        return _lossy_jpeg(im, img, workdir, target, True, base_cost)
     if img.kind == "png":
-        return _lossy_png(im, img, workdir, target, True, base_len)
+        return _lossy_png(im, img, workdir, target, True, base_cost)
     return None
 
 
@@ -880,18 +929,19 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
     """Replace base with a lossy variant only when strictly smaller and valid."""
     if not base or len(img.raw) < LOSSY_MIN_BYTES:
         return base
-    variant = _lossy_variant(img, workdir, target, len(base))
+    base_cost = _packed_cost(base)
+    variant = _lossy_variant(img, workdir, target, base_cost)
     if variant is None:
         return base
     vbytes, vsize = variant
     if not vbytes.startswith((PNG_MAGIC, JPEG_MAGIC)):
         return base
     vkind = "png" if vbytes.startswith(PNG_MAGIC) else "jpg"
-    if not 0 < len(vbytes) < len(base) and not (
+    if not 0 < _packed_cost(vbytes) < base_cost and not (
             vkind == "png" and len(vbytes) < ECT_FAST_BYTES):
         return base
     # Squeeze the lossy bytes through the same lossless pass.
-    ltmp = os.path.join(workdir, "lossy_%04d.%s" % (img.idx, vkind))
+    ltmp = os.path.join(workdir, f"lossy_{img.idx:04d}.{vkind}")
     try:
         with open(ltmp, "wb") as fh:
             fh.write(vbytes)
@@ -904,7 +954,7 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
                 eco = fh.read()
         except OSError:
             return base
-        if not 0 < len(eco) < len(base):
+        if not 0 < _packed_cost(eco) < base_cost:
             return base
         if not _looks_complete(vkind, eco):
             return base

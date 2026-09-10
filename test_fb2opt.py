@@ -586,18 +586,44 @@ class TestLossySearch(unittest.TestCase):
             self.assertIsNone(
                 mod._lossy_variant(self._img(b"GIF89a..", "gif"), d, 0.9))
 
-    def test_try_lossy_smaller_wins(self):
+    def test_try_lossy_packed_cost_decides(self):
+        # Audit §2 in miniature: raw-smaller but packed-bigger loses.
         import io as _io
+        import random as _rnd
         small = _io.BytesIO()
         _gradient(8, 8).save(small, "PNG")
         small_png = small.getvalue()
-        big = mod.PNG_MAGIC + b"z" * 5000 + mod.PNG_TRAILER
-        img = self._img(big, "png")
+        flat_big = mod.PNG_MAGIC + b"z" * 5000 + mod.PNG_TRAILER
+        rng = _rnd.Random(42)
+        noisy_big = mod.PNG_MAGIC + rng.randbytes(5000) + mod.PNG_TRAILER
+        self.assertLess(len(small_png), len(flat_big))
+        self.assertGreater(mod._packed_cost(small_png),
+                           mod._packed_cost(flat_big))
+        self.assertLess(mod._packed_cost(small_png),
+                        mod._packed_cost(noisy_big))
+        img = self._img(flat_big, "png")
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(mod, "_lossy_variant",
                                    return_value=(small_png, (8, 8))):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
-                    self.assertEqual(mod._try_lossy(img, d, 0.9, big), small_png)
+                    self.assertEqual(mod._try_lossy(img, d, 0.9, flat_big),
+                                     flat_big)
+        img = self._img(noisy_big, "png")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small_png, (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    self.assertEqual(mod._try_lossy(img, d, 0.9, noisy_big),
+                                     small_png)
+
+    def test_packed_cost_properties(self):
+        import random as _rnd
+        rng = _rnd.Random(7)
+        zeros = b"\0" * 1000
+        noise = rng.randbytes(1000)
+        self.assertEqual(mod._packed_cost(b""), 0)
+        self.assertLess(mod._packed_cost(zeros), mod._packed_cost(noise))
+        self.assertLess(mod._packed_cost(zeros), 1000)
 
     def test_try_lossy_rejects_bigger(self):
         big = mod.PNG_MAGIC + b"z" * 5000 + mod.PNG_TRAILER
@@ -1069,6 +1095,102 @@ class TestSmartLossy(unittest.TestCase):
         got = mod._pil_open(out[0])
         # L probe wins on near-gray: result decodes gray
         self.assertTrue(mod._is_exact_gray(got) or got.mode == "RGB")
+
+
+
+
+
+def _text_png():
+    from PIL import Image as _I, PngImagePlugin as _P
+    im = _I.new("RGB", (32, 32), (110, 110, 110))
+    info = _P.PngInfo()
+    info.add_text("Comment", "scan 12")
+    import io as _io
+    buf = _io.BytesIO()
+    im.save(buf, "PNG", pnginfo=info)
+    return buf.getvalue()
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestMetadataHonesty(unittest.TestCase):
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="m", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_text_chunk_survives_gray(self):
+        from PIL import Image as _I
+        raw = _text_png()
+        self.assertIn("Comment", _I.open(__import__("io").BytesIO(raw)).text)
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(raw, "png"), d,
+                                             raw, False)
+        back = _I.open(__import__("io").BytesIO(out))
+        back.load()
+        self.assertEqual(back.mode, "L")  # conversion happened...
+        self.assertEqual(back.text.get("Comment"), "scan 12")  # ...metadata kept
+        self.assertTrue(mod._pixels_equal(out, raw))
+
+    def test_exif_blocks_jpeg_to_png(self):
+        from PIL import Image as _I
+        crafted = _flat_two_color()
+        crafted.info["exif"] = b"fake-exif"
+        raw = _jpeg_bytes(_flat_two_color(), 90)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_distinct_colors",
+                                   wraps=mod._distinct_colors) as spy:
+                with mock.patch.object(mod, "_pil_open", return_value=crafted):
+                    out = mod._try_lossless_variants(img, d, raw, False)
+        self.assertEqual(out, raw)
+        self.assertEqual(spy.call_count, 0)  # no attempt at all
+        with tempfile.TemporaryDirectory() as d:
+            del crafted.info["exif"]
+            with mock.patch.object(mod, "_distinct_colors",
+                                   wraps=mod._distinct_colors) as spy:
+                with mock.patch.object(mod, "_pil_open", return_value=crafted):
+                    mod._try_lossless_variants(img, d, raw, False)
+        self.assertGreater(spy.call_count, 0)  # control: attempt proceeds
+
+    def test_flat_scan_book_stays_honest(self):
+        from PIL import Image as _I, ImageDraw as _D
+        im = _I.new("RGB", (350, 500), "white")
+        d = _D.Draw(im)
+        for y in range(20, 500, 18):
+            d.rectangle([30, y, 320, y + 8], fill="black")
+        raw = _jpeg_bytes(im, 95)
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            zp = os.path.join(d, "flat.fb2.zip")
+            make_zip(zp, fb2)
+            before = os.path.getsize(zp)
+            saved, _ = mod.optimize_zip_file(
+                zp, tempfile.mkdtemp(dir=d), False, [])
+            after = os.path.getsize(zp)
+            self.assertLessEqual(after, before)
+            with zipfile.ZipFile(zp) as z:
+                assert z.testzip() is None
+                data = z.read("book.fb2")
+        import re as _re
+        m = _re.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", data, _re.DOTALL)
+        self.assertIsNotNone(m)
+        self.assertTrue(mod._pixels_equal(
+            base64.b64decode(b"".join(m.group(1).split())), raw))
+
+
+HAVE_ECT = __import__("shutil").which("ect") is not None
+
+
+@unittest.skipUnless(HAS_PIL and HAVE_ECT, "need Pillow + real ect")
+class TestWithRealEct(unittest.TestCase):
+    def test_exact_variant_end_to_end(self):
+        raw = _png_bytes(_solid("RGB", (48, 48), (60, 60, 60)))
+        img = mod._Image(idx=0, img_id="g", kind="png", raw=raw,
+                         orig_b64_len=10, attrs="", orig_body="")
+        with tempfile.TemporaryDirectory() as d:
+            out = mod.optimize_images([img], d, True)
+        self.assertLessEqual(mod._packed_cost(out[0]),
+                             mod._packed_cost(raw))
+        self.assertTrue(mod._pixels_equal(out[0], raw))
 
 
 if __name__ == "__main__":

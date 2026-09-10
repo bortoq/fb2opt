@@ -56,7 +56,10 @@ the unpacked FB2 delta.
 
 ## Safety notes
 
-- The tool is lossless by design, but keep backups of books you care about.
+- "Lossless" means pixels: default mode never changes a decoded pixel
+  (every re-encoding is verified identical before it is kept). PNG text
+  chunks and ICC profiles survive re-encoding; JPEG metadata (EXIF/ICC)
+  is stripped by design. Keep backups of books you care about.
 - Originals are replaced only when the new file is smaller; replacement
   is atomic (`os.replace`), so a crash never leaves a half-written book.
 - Temp-file cleanup only ever deletes `fb2opt`'s own `.fb2opt-*.zip`
