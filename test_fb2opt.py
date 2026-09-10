@@ -689,6 +689,7 @@ class TestLossyBatchAndCli(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
         self.assertIn("Dependencies", buf.getvalue())
         self.assertIn("ect", buf.getvalue())
+        self.assertIn(mod.VERSION, buf.getvalue())
 
     def test_bare_r_walks_cwd(self):
         import contextlib
@@ -708,6 +709,7 @@ class TestLossyBatchAndCli(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(d, "b.fb2.zip")))
             self.assertTrue(os.path.exists(os.path.join(sub, "c.fb2.zip")))
 
+    @unittest.skipUnless(HAS_PIL, "Pillow missing")
     def test_lossy_on_zip_book(self):
         from PIL import Image as _I
         import io as _io
@@ -1021,9 +1023,41 @@ class TestLosslessVariants(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(mod, "_ect_squeeze", spy):
                 out = mod._try_lossless_variants(img, d, raw, True)
-        self.assertIn("png", seen)  # crossover attempted
         self.assertTrue(mod._pixels_equal(out, raw))
-        self.assertLessEqual(len(out), len(raw))
+        self.assertLessEqual(mod._packed_cost(out), mod._packed_cost(raw))
+
+    def test_ratio_gate_skips_hopeless_ect(self):
+        # §5.2: candidate packed 3x over base -> no ect pass; ~1x -> chance.
+        gray = _solid("RGB", (32, 32), (90, 90, 90))
+        import io as _io
+        buf = _io.BytesIO()
+        gray.save(buf, "PNG")
+        raw = buf.getvalue()
+        img = self._img(raw, "png")
+        real_cost = mod._packed_cost
+
+        def _scaled(factor):
+            def _fake(b):
+                if _fake.first:
+                    _fake.first = False
+                    return real_cost(b)
+                return int(real_cost(b) * factor)
+            _fake.first = True
+            return _fake
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_packed_cost", _scaled(3.0)):
+                with mock.patch.object(mod, "_ect_squeeze") as squeeze:
+                    out = mod._try_lossless_variants(img, d, raw, True)
+            self.assertEqual(squeeze.call_count, 0)
+            self.assertEqual(out, raw)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_packed_cost", _scaled(1.0)):
+                with mock.patch.object(mod, "_ect_squeeze",
+                                       wraps=mod._ect_squeeze) as squeeze:
+                    out = mod._try_lossless_variants(img, d, raw, True)
+            self.assertGreater(squeeze.call_count, 0)
+            self.assertTrue(mod._pixels_equal(out, raw))
 
     def test_kind_change_rewrites_content_type(self):
         fb2 = make_fb2()
@@ -1112,6 +1146,7 @@ def _text_png():
 
 
 @unittest.skipUnless(HAS_PIL, "Pillow missing")
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
 class TestMetadataHonesty(unittest.TestCase):
     def _img(self, raw, kind):
         return mod._Image(idx=0, img_id="m", kind=kind, raw=raw,
@@ -1191,6 +1226,74 @@ class TestWithRealEct(unittest.TestCase):
         self.assertLessEqual(mod._packed_cost(out[0]),
                              mod._packed_cost(raw))
         self.assertTrue(mod._pixels_equal(out[0], raw))
+
+
+
+
+
+class TestLossyMarker(unittest.TestCase):
+    def test_mark_helpers(self):
+        self.assertIsNone(mod._lossy_mark(""))
+        self.assertIsNone(mod._lossy_mark(' id="a"'))
+        self.assertAlmostEqual(
+            mod._lossy_mark(' id="a" fb2opt-lossy="0.92"'), 0.92)
+        self.assertIsNone(mod._lossy_mark(' fb2opt-lossy="junk"'))
+        out = mod._set_lossy_mark(' id="a"', 0.92)
+        self.assertIn('fb2opt-lossy="0.92"', out)
+        self.assertIn('id="a"', out)
+        twice = mod._set_lossy_mark(out, 0.85)
+        self.assertEqual(twice.count("fb2opt-lossy"), 1)
+        self.assertIn('"0.85"', twice)
+
+    def test_variant_skips_marked(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        raw = _jpeg_bytes(_gradient(64, 64), 90)
+        img = mod._Image(idx=0, img_id="m", kind="jpg", raw=raw,
+                         orig_b64_len=10,
+                         attrs=' id="m" fb2opt-lossy="0.92"', orig_body="")
+        def _boom(a, b):
+            raise AssertionError("metric must not run on marked")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                self.assertIsNone(mod._lossy_variant(img, d, 0.92))
+                self.assertIsNone(mod._lossy_variant(img, d, 0.95))
+        # stricter target re-opens the search (metric runs, may still lose)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.99):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    out = mod._lossy_variant(img, d, 0.85)
+        self.assertIsNotNone(out)
+
+    def test_mark_written_and_honored_on_rerun(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        import random as _rnd
+        from PIL import Image as _I
+        small = _io.BytesIO()
+        _gradient(8, 8).quantize(colors=8, method=_I.MEDIANCUT,
+                                 dither=_I.Dither.NONE).save(small, "PNG")
+        small_png = small.getvalue()
+        noisy = (mod.PNG_MAGIC + _rnd.Random(3).randbytes(5000)
+                 + mod.PNG_TRAILER)
+        fb2 = make_fb2(base64.b64encode(noisy).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small_png, (8, 8))):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        text = new.decode("utf-8")
+        self.assertIn('fb2opt-lossy="0.92"', text)
+        # re-run: marked image is shielded, metric never runs
+        def _boom(a, b):
+            raise AssertionError("metric must not run on marked")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new2, stats2 = mod.optimize_fb2_payload(new, d, False, 0.92)
+        self.assertEqual(stats2.marked, 1)
+        self.assertEqual(new2, new)
 
 
 if __name__ == "__main__":

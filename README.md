@@ -34,10 +34,10 @@ chmod +x ~/bin/fb2opt
 
 ```sh
 fb2opt BOOK.fb2.zip [BOOK2.fb2.zip ...]   # optimize (replace only if smaller)
-fb2opt --lossy ...                        # same, images also lossy
+fb2opt --lossy                             # same, images also lossy
 fb2opt -r                                 # walk current folder (nested)
 fb2opt BOOK.fb2 [...]                     # pack raw .fb2 into .fb2.zip next to it
-fb2opt --extract BOOK                     # pull images into current folder
+fb2opt --extract BOOK.fb2                 # pull images into current folder
 fb2opt --pack BOOK.fb2                    # put images from current folder into the book
 fb2opt -h                                 # full help + dependencies
 ```
@@ -104,6 +104,10 @@ file itself and guarded by a metric — nothing is taken on faith.
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
   refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
+- No silent re-lossy: images `--lossy` compresses get an `fb2opt-lossy`
+  stamp with the applied target. A re-run skips stamped images (only
+  a strictly lower target re-opens them), so quality never ratchets
+  down run after run.
 - Presets (measured on painterly cover scans): `0.99` (conservative,
   safe everywhere) ≈ −10 % over lossless; `0.95` (balanced);
   `0.92` (default: ≈ −70 % on covers, SSIM ≈ 0.93 / PSNR ≈ 30 dB —

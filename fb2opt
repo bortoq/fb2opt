@@ -4,8 +4,8 @@
 
 One file, three modes:
   optimize (default) — recompress images (PNG/JPEG) and XML, repack the ZIP;
-  --extract          — pull images out of a book;
-  --pack             — put images from a folder back into a book.
+  --extract          — pull images into the current folder;
+  --pack             — put images from the current folder back into a book.
 
 Replacement rule:
   the new file replaces the old one ONLY if (old_size - new_size) > 0,
@@ -60,7 +60,7 @@ INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
                          "strong", "style", "sub", "sup"})
 
 DEPS: tuple[tuple[str, str], ...] = (
-    ("ect", "lossless PNG / JPEG / ZIP compression, metadata stripping"),
+    ("ect", "lossless PNG / JPEG / ZIP"),
     ("Pillow", "lossy JPEG / PNG encoding (with --lossy only)"),
     ("ffmpeg", "lossy quality metric SSIM (with --lossy only)"),
 )
@@ -72,7 +72,7 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.3"
+VERSION = "4.4"
 
 # Smart image heuristics (real-world files of unknown origin).
 LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
@@ -80,6 +80,7 @@ LOSSY_MIN_BYTES = 2048  # skip the metric search on tiny images (not worth it)
 LOSSY_PNG_MAX_PX = 2000000  # JPEG->PNG crossover bound (keeps ect -9 fast)
 GRAY_PROBE_SCORE = 6.0  # below this mean chroma: one extra L-mode probe
 ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try
+CLOSE_RATIO = 1.2  # ect only gets its chance within 20% of packed base
 
 LOSSY_DEFAULT_SSIM = 0.92
 
@@ -100,8 +101,10 @@ class Fb2Stats:
     other_saved: int = 0
     xml_saved: int = 0
     skipped: int = 0  # binary blocks left alone (no id / broken base64)
+    marked: int = 0  # images already lossy-stamped, left untouched
 
     def add(self, other: "Fb2Stats") -> None:
+        self.marked += other.marked
         self.pics += other.pics
         self.png_saved += other.png_saved
         self.jpg_saved += other.jpg_saved
@@ -331,14 +334,14 @@ def short_hint() -> str:
     return (
         "fb2opt — optimization of FB2 books (.fb2.zip).\n"
         "Usage:\n"
-        "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller\n"
-        "  fb2opt --lossy ...                same, images also lossy (needs Pillow+ffmpeg\n"
-        "  fb2opt -r                         walk current folder (.fb2.zip, nested\n"
-        "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to i\n"
-        "  fb2opt --extract BOOK             pull images into current folde\n"
-        "  fb2opt --pack BOOK.fb2            put images from current folder into the boo\n"
+        "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
+        "  fb2opt --lossy                    same, images also lossy (Pillow+ffmpeg)\n"
+        "  fb2opt -r                         walk current folder (.fb2.zip, nested)\n"
+        "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
+        "  fb2opt --extract BOOK.fb2         pull images into current folder\n"
+        "  fb2opt --pack BOOK.fb2            images from current folder into the book\n"
         "  fb2opt -h | --help                full help\n"
-        f"{format_deps()}\n"
+f"{format_deps()}\n"
         "The original is replaced only if (old - new) > 0."
     )
 
@@ -359,7 +362,8 @@ def _looks_complete(kind: str, data: bytes) -> bool:
 
 
 def optimize_images(images: list[_Image], workdir: str,
-                    have_ect: bool, lossy: float | None = None
+                    have_ect: bool, lossy: float | None = None,
+                    lossy_marks: list[int] | None = None
                     ) -> dict[int, bytes]:
     """Run images through external optimizers.
 
@@ -413,7 +417,7 @@ def optimize_images(images: list[_Image], workdir: str,
         if Image is not None:
             base = _try_lossless_variants(img, workdir, base, have_ect)
         if lossy is not None and _lossy_tools_ok():
-            base = _try_lossy(img, workdir, lossy, base)
+            base = _try_lossy(img, workdir, lossy, base, lossy_marks)
         result[img.idx] = base
     return result
 
@@ -519,6 +523,33 @@ def _set_content_type(attrs: str, kind: str) -> str:
     return attrs + ' content-type="' + mime + '"'
 
 
+LOSSY_MARK = "fb2opt-lossy"
+
+
+def _lossy_mark(attrs: str) -> float | None:
+    """Applied lossy target read back from a <binary> tag, if any."""
+    if not attrs:
+        return None
+    try:
+        match = re.search(LOSSY_MARK + r'\s*=\s*"([0-9.]+)"', attrs)
+        return float(match.group(1)) if match else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def _set_lossy_mark(attrs: str, target: float) -> str:
+    """Stamp (or refresh) the applied lossy target on a <binary> tag."""
+    stamp = f'{LOSSY_MARK}="{target:.4g}"'
+    if not attrs:
+        return " " + stamp
+    try:
+        new_attrs, n = re.subn(LOSSY_MARK + r'\s*=\s*"[0-9.]+"', stamp,
+                               attrs, count=1)
+    except Exception:
+        return attrs
+    return new_attrs if n else f"{attrs} {stamp}"
+
+
 def _patch_binary_attrs(text: str, img_id: str, new_attrs: str) -> str:
     """Swap the <binary> tag of one id (format change keeps markup honest)."""
     if not text or not img_id or not new_attrs:
@@ -621,9 +652,11 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
         return base
     base_cost = _packed_cost(base)
     for cb, ck in cands:
-        # PIL zlib is weak on PNG: a small candidate may still win after ect.
+        # PIL zlib is weak on PNG: a close candidate may still win after ect.
+        # Beyond CLOSE_RATIO no ect pass ever flipped the verdict — skip it.
         if not cb or (_packed_cost(cb) >= base_cost and not (
-                ck == "png" and have_ect and len(cb) < ECT_FAST_BYTES)):
+                ck == "png" and have_ect and len(cb) < ECT_FAST_BYTES
+                and _packed_cost(cb) < base_cost * CLOSE_RATIO)):
             continue
         if have_ect:
             tmp = os.path.join(workdir, f"exact_{img.idx:04d}.{ck}")
@@ -915,6 +948,9 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
     """Metric-gated lossy bytes for one image. None — keep the lossless path."""
     if Image is None or not have_ffmpeg() or not img.raw:
         return None
+    marked = _lossy_mark(img.attrs or "")
+    if marked is not None and target >= marked:
+        return None  # already lossy at this (or gentler) target: never ratchet
     im = _pil_open(img.raw)
     if im is None:
         return None
@@ -925,7 +961,8 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
     return None
 
 
-def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
+def _try_lossy(img: _Image, workdir: str, target: float, base: bytes,
+               marks: list[int] | None = None) -> bytes:
     """Replace base with a lossy variant only when strictly smaller and valid."""
     if not base or len(img.raw) < LOSSY_MIN_BYTES:
         return base
@@ -960,6 +997,8 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes) -> bytes:
             return base
         if not _same_dims(eco, vsize):
             return base
+        if marks is not None:
+            marks.append(img.idx)
         return eco
     finally:
         try:
@@ -1013,23 +1052,35 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     skeleton_parts.append(text[last:])
     skeleton = "".join(skeleton_parts)
 
-    optimized = optimize_images(images, workdir, have_ect, lossy)
+    lossy_marks: list[int] = []
+    optimized = optimize_images(images, workdir, have_ect, lossy,
+                                lossy_marks)
 
     stats = Fb2Stats(pics=len(images), skipped=skipped)
     blocks: dict[int, str] = {}
-    skeleton_late: list[tuple[str, str, str]] = []
+    skeleton_late: list[tuple[str, str]] = []  # (img_id, final_attrs)
+    mark_set = set(lossy_marks)
     for img in images:
         final = optimized.get(img.idx, img.raw)
         if final == img.raw:
             # The skeleton already holds the tags around the placeholder: swap the body only.
             # Original body = byte-exact same block, delta 0.
             blocks[img.idx] = img.orig_body
+            if lossy is not None:
+                marked = _lossy_mark(img.attrs or "")
+                if marked is not None and lossy >= marked:
+                    stats.marked += 1
             continue
         new_body = encode_body(final)
         blocks[img.idx] = new_body
         final_kind = detect_kind(final, "")
+        attrs = img.attrs
         if final_kind in ("png", "jpg") and final_kind != img.kind:
-            skeleton_late.append((img.img_id, img.attrs, final_kind))
+            attrs = _set_content_type(attrs, final_kind)
+        if lossy is not None and img.idx in mark_set:
+            attrs = _set_lossy_mark(attrs, lossy)
+        if attrs != img.attrs:
+            skeleton_late.append((img.img_id, attrs))
         delta = img.orig_b64_len - len(new_body)
         if img.kind == "png":
             stats.png_saved += delta
@@ -1038,9 +1089,8 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         else:
             stats.other_saved += delta
 
-    for img_id, attrs, kind in skeleton_late:
-        skeleton = _patch_binary_attrs(skeleton, img_id,
-                                       _set_content_type(attrs, kind))
+    for img_id, attrs in skeleton_late:
+        skeleton = _patch_binary_attrs(skeleton, img_id, attrs)
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
         new_skeleton = new_skeleton.replace(f"__FB2OPT_{token}_{img.idx}__",
@@ -1270,6 +1320,10 @@ def _warn_skipped(name: str, stats: Fb2Stats) -> None:
     if stats.skipped:
         print(f"[warning] {name}: skipped {stats.skipped} bad <binary> blocks "
               f"(no id or broken base64)", file=sys.stderr)
+    if stats.marked:
+        print(f"[info] {name}: {stats.marked} images already lossy-stamped, "
+              f"left untouched (re-run --lossy only bites with a lower target)",
+              file=sys.stderr)
 
 
 def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
@@ -1655,13 +1709,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="fb2opt",
         description="Optimization of FB2 books (.fb2.zip). "
                     "The original is replaced only if the new file is smaller.",
-        epilog=format_deps(),
+        epilog=f"fb2opt {VERSION}\n" + format_deps(),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("files", nargs="*", help="books .fb2.zip / .fb2 (--extract: sources; with -r: folders to walk)")
     parser.add_argument("--extract", action="store_true",
-                        help="pull images out of books")
+                        help="pull images into current folder")
     parser.add_argument("--pack", action="store_true",
-                        help="put images from a folder into a book")
+                        help="put images from current folder into the book")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="print errors only")
     parser.add_argument("-r", "--recursive", action="store_true",
