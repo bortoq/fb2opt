@@ -74,7 +74,7 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.5"
+VERSION = "4.6"
 
 # Smart image heuristics (real-world files of unknown origin).
 LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
@@ -707,7 +707,8 @@ def _write_lossy_token(skeleton: str, known: dict[str, float],
     original — worth one stderr line. Never raises.
     """
     reopened = sum(1 for img in images
-                   if img.img_id in known and known[img.img_id] > lossy)
+                   if img.idx in mark_set and img.img_id in known
+                   and known[img.img_id] > lossy)
     try:
         for img in images:
             if img.idx in mark_set:
@@ -815,70 +816,126 @@ def _ect_squeeze(path: str, kind: str) -> None:
         run_tool(["ect", "-9", "-strip", "-progressive", path])
 
 
+def _encode_png_bytes(im, meta_from=None) -> bytes | None:
+    """PIL PNG bytes, metadata-preserving. None on encode trouble."""
+    if meta_from is None:
+        meta_from = im
+    try:
+        buf = io.BytesIO()
+        _save_png(im, buf, meta_from=meta_from)
+        return buf.getvalue()
+    except (OSError, ValueError):
+        return None
+
+
+def _exact_png_candidates(img: _Image, im) -> list[tuple[bytes, str]]:
+    """Pixel-exact PNG re-encodings: gray, rgb->palette, palette trim."""
+    cands: list[tuple[bytes, str]] = []
+    if im.mode == "RGB" and _is_exact_gray(im):
+        gray = im.convert("L")
+        enc = _encode_png_bytes(gray, im)
+        if enc is not None and _pixels_equal(enc, img.raw):
+            cands.append((enc, "png"))
+    if im.mode == "RGB":
+        n = _distinct_colors(im)
+        if n is not None and 1 <= n <= 256:
+            q = im.quantize(colors=max(n, 2), method=Image.MEDIANCUT,
+                            dither=Image.Dither.NONE)
+            enc = _encode_png_bytes(q, im)
+            if enc is not None and _pixels_equal(enc, img.raw):
+                cands.append((enc, "png"))
+    if im.mode == "P":
+        try:
+            pal_size = len(im.getpalette()) // 3
+        except (TypeError, AttributeError):
+            pal_size = 256
+        n = _distinct_colors(im)
+        if n is not None and 1 <= n < pal_size:
+            q = im.convert("RGB").quantize(
+                colors=max(n, 2), method=Image.MEDIANCUT,
+                dither=Image.Dither.NONE)
+            enc = _encode_png_bytes(q, im)
+            if enc is not None and _pixels_equal(enc, img.raw):
+                cands.append((enc, "png"))
+    return cands
+
+
+def _exact_jpeg_candidates(img: _Image, im) -> list[tuple[bytes, str]]:
+    """Pixel-exact JPEG->PNG crossover for flat graphics.
+
+    Skipped with EXIF/ICC aboard: PNG cannot carry them, and EXIF
+    orientation decides how readers show the file — never flip silently.
+    """
+    if im.mode not in ("RGB", "L", "P"):
+        return []
+    if im.info.get("exif") or im.info.get("icc_profile"):
+        return []
+    w, h = im.size
+    if w * h > LOSSY_PNG_MAX_PX:
+        return []
+    # JPEG ringing around flat graphics pushes the count into the
+    # hundreds; photos have orders of magnitude more.
+    n = _distinct_colors(im, limit=4097)
+    if n is None or not 1 <= n <= 4096:
+        return []
+    enc = _encode_png_bytes(im.convert("RGB"), im)
+    if enc is not None and _pixels_equal(enc, img.raw):
+        return [(enc, "png")]
+    return []
+
+
+def _squeeze_candidate(img: _Image, workdir: str, cb: bytes, ck: str,
+                       base: bytes, base_cost: int, have_ect: bool
+                       ) -> tuple[bytes, int]:
+    """Run one candidate through ect, keep the packed-smaller. Never raises."""
+    if not have_ect:
+        return cb, _packed_cost(cb)
+    tmp = os.path.join(workdir, f"exact_{img.idx:04d}.{ck}")
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(cb)
+    except OSError:
+        return base, base_cost
+    try:
+        _ect_squeeze(tmp, ck)
+        try:
+            with open(tmp, "rb") as fh:
+                eco = fh.read()
+        except OSError:
+            return base, base_cost
+        if (_packed_cost(eco) < base_cost
+                and _looks_complete(ck, eco)
+                and _pixels_equal(eco, img.raw)):
+            return eco, _packed_cost(eco)
+        return base, base_cost
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                            have_ect: bool) -> bytes:
     """Pixel-exact re-encodings: gray, palette trim, JPEG->PNG.
 
     Every candidate is verified identical to the source pixels and kept
-    only when strictly smaller (after its own ect pass). Never raises.
+    only when packed-smaller (after its own ect pass). Never raises.
     """
     if not base or Image is None or not img.raw:
         return base
-    try:
-        im = _pil_open(img.raw)
-    except Exception:
-        return base
+    im = _pil_open(img.raw)
     if im is None or _has_alpha(im):
         return base
-    cands: list[tuple[bytes, str]] = []
     try:
+        # Pillow raises an open-ended zoo (struct.error, SyntaxError, ...)
+        # on hostile inputs — the one place a broad net is justified.
         if img.kind == "png":
-            if im.mode == "RGB" and _is_exact_gray(im):
-                gray = im.convert("L")
-                buf = io.BytesIO()
-                _save_png(gray, buf, meta_from=im)
-                if _pixels_equal(buf.getvalue(), img.raw):
-                    cands.append((buf.getvalue(), "png"))
-            if im.mode == "RGB":
-                n = _distinct_colors(im)
-                if n is not None and 1 <= n <= 256:
-                    q = im.quantize(colors=max(n, 2),
-                                    method=Image.MEDIANCUT,
-                                    dither=Image.Dither.NONE)
-                    buf = io.BytesIO()
-                    _save_png(q, buf, meta_from=im)
-                    if _pixels_equal(buf.getvalue(), img.raw):
-                        cands.append((buf.getvalue(), "png"))
-            if im.mode == "P":
-                try:
-                    pal_size = len(im.getpalette()) // 3
-                except (TypeError, AttributeError):
-                    pal_size = 256
-                n = _distinct_colors(im)
-                if n is not None and 1 <= n < pal_size:
-                    q = im.convert("RGB").quantize(
-                        colors=max(n, 2), method=Image.MEDIANCUT,
-                        dither=Image.Dither.NONE)
-                    buf = io.BytesIO()
-                    _save_png(q, buf, meta_from=im)
-                    if _pixels_equal(buf.getvalue(), img.raw):
-                        cands.append((buf.getvalue(), "png"))
+            cands = _exact_png_candidates(img, im)
         elif img.kind == "jpg":
-            if im.mode in ("RGB", "L", "P") and not im.info.get("exif") \
-                    and not im.info.get("icc_profile"):
-                # No EXIF/ICC: PNG cannot carry them, and EXIF orientation
-                # decides how readers show the file — never flip it silently.
-                w, h = im.size
-                if w * h <= LOSSY_PNG_MAX_PX:
-                    # JPEG ringing around flat graphics pushes the count
-                    # into the hundreds; photos have orders of magnitude more.
-                    n = _distinct_colors(im, limit=4097)
-                    if n is not None and 1 <= n <= 4096:
-                        work = im.convert("RGB")
-                        buf = io.BytesIO()
-                        _save_png(work, buf, meta_from=im)
-                        if _pixels_equal(buf.getvalue(), img.raw):
-                            cands.append((buf.getvalue(), "png"))
+            cands = _exact_jpeg_candidates(img, im)
+        else:
+            cands = []
     except Exception:
         return base
     base_cost = _packed_cost(base)
@@ -889,33 +946,8 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
                 ck == "png" and have_ect and len(cb) < ECT_FAST_BYTES
                 and _packed_cost(cb) < base_cost * CLOSE_RATIO)):
             continue
-        if have_ect:
-            tmp = os.path.join(workdir, f"exact_{img.idx:04d}.{ck}")
-            try:
-                with open(tmp, "wb") as fh:
-                    fh.write(cb)
-            except OSError:
-                continue
-            try:
-                _ect_squeeze(tmp, ck)
-                try:
-                    with open(tmp, "rb") as fh:
-                        eco = fh.read()
-                except OSError:
-                    continue
-                if (_packed_cost(eco) < base_cost
-                        and _looks_complete(ck, eco)
-                        and _pixels_equal(eco, img.raw)):
-                    base = eco
-                    base_cost = _packed_cost(eco)
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-        else:
-            base = cb
-            base_cost = _packed_cost(cb)
+        base, base_cost = _squeeze_candidate(img, workdir, cb, ck,
+                                             base, base_cost, have_ect)
     return base
 
 
@@ -1297,6 +1329,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     blocks: dict[int, str] = {}
     skeleton_late: list[tuple[str, str]] = []  # (img_id, final_attrs)
     mark_set = set(lossy_marks)
+    kind_stripped = 0
     for img in images:
         final = optimized.get(img.idx, img.raw)
         if final == img.raw:
@@ -1311,10 +1344,15 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         new_body = encode_body(final)
         blocks[img.idx] = new_body
         final_kind = detect_kind(final, "")
-        attrs = _strip_mark_from_attrs(real_attrs[img.idx])
+        raw_attrs = real_attrs[img.idx]
+        # Legacy marks leave the tags only under --lossy (migration);
+        # default mode never rewrites user markup beyond content-type.
+        attrs = (_strip_mark_from_attrs(raw_attrs) if lossy is not None
+                 else raw_attrs)
+        kind_stripped += len(raw_attrs) - len(attrs)
         if final_kind in ("png", "jpg") and final_kind != img.kind:
             attrs = _set_content_type(attrs, final_kind)
-        if attrs != real_attrs[img.idx]:
+        if attrs != raw_attrs:
             skeleton_late.append((img.img_id, attrs))
         delta = img.orig_b64_len - len(new_body)
         if img.kind == "png":
@@ -1332,6 +1370,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
             skeleton, known, present_ids, images, mark_set, lossy,
             real_attrs)
         stats.reopened += reopened
+        old_ann += kind_stripped
     stats.marks = old_ann - new_ann
     new_skeleton = minify_skeleton(skeleton)
     for img in images:

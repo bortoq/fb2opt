@@ -1443,18 +1443,26 @@ class TestOutputInvariants(unittest.TestCase):
 
 
 class TestReopenedAndWrapper(unittest.TestCase):
-    def _fb2_marked(self, target):
-        fb2 = make_fb2()
-        return fb2.replace(b'id="cover"',
-                           b'id="cover" fb2opt-lossy="%s"' % str(target).encode(),
-                           1)
-
     def test_reopened_count_and_warning(self):
+        # A stricter target re-opens a stamped image that actually wins
+        # again; the warning fires exactly then (not on no-op runs).
         if not HAS_PIL:
             self.skipTest("Pillow missing")
-        fb2 = self._fb2_marked(0.95)
+        import io as _io
+        import random as _rnd
+        from PIL import Image as _I
+        small = _io.BytesIO()
+        _gradient(8, 8).quantize(colors=8, method=_I.MEDIANCUT,
+                                 dither=_I.Dither.NONE).save(small, "PNG")
+        small_png = small.getvalue()
+        noisy = (mod.PNG_MAGIC + _rnd.Random(21).randbytes(5000)
+                 + mod.PNG_TRAILER)
+        fb2 = make_fb2(base64.b64encode(noisy).decode())
+        fb2 = fb2.replace(b'id="cover"',
+                          b'id="cover" fb2opt-lossy="0.95"', 1)
         with tempfile.TemporaryDirectory() as d:
-            with mock.patch.object(mod, "_lossy_variant", return_value=None):
+            with mock.patch.object(mod, "_lossy_variant",
+                                   return_value=(small_png, (8, 8))):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
                     with mock.patch.object(mod, "_lossy_tools_ok",
                                            return_value=True):
@@ -1462,6 +1470,7 @@ class TestReopenedAndWrapper(unittest.TestCase):
                             fb2, d, False, 0.85)
         self.assertEqual(stats.reopened, 1)
         self.assertEqual(stats.marked, 0)
+        self.assertIn(b"fb2opt-lossy[0.85:cover]", new)
         err = io.StringIO()
         with redirect_stderr(err):
             mod._warn_skipped("b.fb2.zip", stats)
