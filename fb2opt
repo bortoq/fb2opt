@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import concurrent.futures
 import io
 import os
 import re
@@ -28,6 +29,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -55,7 +57,8 @@ ID_RE = re.compile(r"""id\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
 COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
 # Whitespace strictly between two tags (element-only content). Never touches text.
-GAP_RE = re.compile(r"(<[^<>]*>)[ \t\r\n]+(<[^<>]*>)")
+# Lookahead keeps the right tag unconsumed: one pass handles chained gaps O(N).
+GAP_RE = re.compile(r"(<[^<>]*>)[ \t\r\n]+(?=(<[^<>]*>))")
 # Gaps between two of these render as a space: collapse to one space,
 # everywhere else the gap is removed entirely.
 INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
@@ -74,7 +77,7 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
-VERSION = "4.6"
+VERSION = "4.7"
 
 # Smart image heuristics (real-world files of unknown origin).
 LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
@@ -85,6 +88,18 @@ ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try
 CLOSE_RATIO = 1.2  # ect only gets its chance within 20% of packed base
 
 LOSSY_DEFAULT_SSIM = 0.92
+
+GENERIC_SAFE_FORMATS = frozenset({"BMP", "PPM"})
+
+# DoS guards: hostile archives/images must fail loudly, not OOM the batch.
+MAX_ARCHIVE_MEMBERS = 10000  # entries per ZIP
+MAX_MEMBER_BYTES = 500 * 1024 * 1024  # one unpacked member
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024  # unpacked total per archive
+MAX_IMAGE_PX = 50_000_000  # decoded pixels per image (~50 MP)
+
+_UMASK_LOCK = threading.Lock()
+_CACHED_UMASK: int | None = None
+_REGISTRY_LOCK = threading.Lock()
 
 
 class Fb2OptError(Exception):
@@ -194,21 +209,30 @@ def decode_body(body: str) -> bytes | None:
         return None
     try:
         cleaned = "".join(body.split())
-    except Exception:
+    except (AttributeError, TypeError):
         return None
     if not cleaned:
         return None
     try:
-        data = base64.b64decode(cleaned)
+        data = base64.b64decode(cleaned, validate=True)
     except (binascii.Error, ValueError):
         return None
     return data or None
 
 
 def encode_body(raw: bytes) -> str:
-    """Encode image bytes as canonical base64 (76-char lines)."""
-    b64 = base64.b64encode(raw).decode("ascii")
-    return "\n" + "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)) + "\n"
+    """Encode image bytes as single-line base64 (no wrapping at all)."""
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _flat_b64_len(raw: bytes) -> int:
+    """Single-line base64 length without encoding: 4 * ceil(n/3)."""
+    if not raw:
+        return 0
+    try:
+        return (len(raw) + 2) // 3 * 4
+    except (TypeError, OverflowError):
+        return 0
 
 
 def _packed_cost(raw: bytes) -> int:
@@ -217,8 +241,8 @@ def _packed_cost(raw: bytes) -> int:
         return 0
     try:
         return len(zlib.compress(encode_body(raw).encode("ascii"), 9))
-    except Exception:
-        return len(raw)
+    except (TypeError, ValueError, zlib.error):
+        return len(raw) if isinstance(raw, bytes) else 0
 
 
 def _tag_name(tag: str) -> str:
@@ -232,11 +256,45 @@ def _tag_name(tag: str) -> str:
 
 
 def _gap_replace(match: re.Match) -> str:
-    """Collapse one inter-tag gap: one space between two inline tags, else nothing."""
+    """Collapse one inter-tag gap: one space between two inline tags, else nothing.
+
+    GAP_RE uses a lookahead for the right tag, so it stays in the input
+    and the next gap can start from it — a single sub() pass is enough. """
     left, right = match.group(1), match.group(2)
     if _tag_name(left) in INLINE_TAGS and _tag_name(right) in INLINE_TAGS:
-        return f"{left} {right}"
-    return f"{left}{right}"
+        return f"{left} "
+    return left
+
+
+def _ignored_spans(text: str) -> list[tuple[int, int]]:
+    """Spans of comments and CDATA (never real <binary> blocks)."""
+    if not text:
+        return []
+    spans: list[tuple[int, int]] = []
+    try:
+        for rx in (COMMENT_RE, CDATA_RE):
+            for m in rx.finditer(text):
+                spans.append((m.start(), m.end()))
+    except (TypeError, re.error):
+        return []
+    return spans
+
+
+def _binary_matches(text: str):
+    """BINARY_RE matches outside comments/CDATA (real images only)."""
+    if not text:
+        return
+    spans = _ignored_spans(text)
+
+    def _inside(pos: int) -> bool:
+        for s, e in spans:
+            if s <= pos < e:
+                return True
+        return False
+
+    for m in BINARY_RE.finditer(text):
+        if not _inside(m.start()):
+            yield m
 
 
 def minify_skeleton(text: str) -> str:
@@ -260,11 +318,8 @@ def minify_skeleton(text: str) -> str:
 
     masked = CDATA_RE.sub(_mask, text)
     masked = COMMENT_RE.sub("", masked)
-    # One pass eats every second gap (consumed tags), so run to fixpoint.
-    previous = None
-    while masked != previous:
-        previous = masked
-        masked = GAP_RE.sub(_gap_replace, masked)
+    # Single pass: GAP_RE lookahead leaves the right tag for the next gap.
+    masked = GAP_RE.sub(_gap_replace, masked)
     for idx, section in enumerate(cdata):
         masked = masked.replace(f"__FB2OPT_CDATA_{token}_{idx}__", section, 1)
     return masked
@@ -299,6 +354,14 @@ def unique_path(path: str) -> str:
 # Dependencies
 # --------------------------------------------------------------------------
 
+def _cpu_count() -> int:
+    """Usable cores, at least 1. Never raises."""
+    try:
+        return max(1, os.cpu_count() or 1)
+    except (NotImplementedError, AttributeError, TypeError, OSError):
+        return 1
+
+
 def have_pil() -> bool:
     """Pillow available (lossy encoder)."""
     return Image is not None
@@ -316,8 +379,8 @@ def _lossy_tools_ok() -> bool:
 
 _DEP_CHECKS = {
     "ect": lambda: shutil.which("ect") is not None,
-    "Pillow": have_pil,
-    "ffmpeg": have_ffmpeg,
+    "Pillow": lambda: have_pil(),
+    "ffmpeg": lambda: have_ffmpeg(),
 }
 
 
@@ -368,64 +431,83 @@ def _looks_complete(kind: str, data: bytes) -> bool:
     return True
 
 
+def _process_image(img: _Image, workdir: str, have_ect: bool,
+                   lossy: float | None,
+                   lossy_marks: list[int] | None) -> tuple[int, bytes]:
+    """Optimize one image; returns (idx, final_bytes). Thread-safe.
+
+    Temp names carry the image idx, so workers never share a file.
+    Appends to lossy_marks are atomic under the GIL; order is irrelevant
+    (the list is consumed as a set).
+    """
+    if not img.raw:
+        return img.idx, img.raw
+    if img.kind not in ("png", "jpg"):
+        return img.idx, img.raw  # gif/other need no tool, keep as is
+    if not have_ect and lossy is None and Image is None:
+        return img.idx, img.raw  # no optimizer at all: keep as is
+    base = img.raw
+    if have_ect:
+        tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
+                                    f".{img.kind}")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(img.raw)
+        except OSError:
+            return img.idx, img.raw
+        _ect_squeeze(tmp, img.kind)
+        try:
+            with open(tmp, "rb") as fh:
+                optimized = fh.read()
+        except OSError:
+            optimized = img.raw
+        # Guard against pessimization: keep the packed-smaller.
+        if 0 < _packed_cost(optimized) < _packed_cost(img.raw):
+            # The optimizer must return a complete image, not a truncated one.
+            if _looks_complete(img.kind, optimized):
+                base = optimized
+            else:
+                print(f"[warning] {img.img_id}: optimizer output failed validation, "
+                      f"kept original", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if Image is not None:
+        base = _try_lossless_variants(img, workdir, base, have_ect)
+    if lossy is not None and _lossy_tools_ok():
+        base = _try_lossy(img, workdir, lossy, base, lossy_marks)
+    return img.idx, base
+
+
 def optimize_images(images: list[_Image], workdir: str,
                     have_ect: bool, lossy: float | None = None,
-                    lossy_marks: list[int] | None = None
-                    ) -> dict[int, bytes]:
+                    lossy_marks: list[int] | None = None,
+                    workers: int = 1) -> dict[int, bytes]:
     """Run images through external optimizers.
 
     Returns {idx: final_bytes}. Each image keeps the smaller of
     (original, optimized) — a single file never grows.
     With lossy (min SSIM 0..1): a metric-gated lossy variant may win,
     but only when strictly smaller than the lossless result.
+    workers > 1 spreads images over threads (same bytes out).
     """
     result: dict[int, bytes] = {}
     if not images:
         return result
     os.makedirs(workdir, exist_ok=True)
-    for img in images:
-        if not img.raw:
-            result[img.idx] = img.raw
-            continue
-        if img.kind not in ("png", "jpg"):
-            result[img.idx] = img.raw  # gif/other need no tool, keep as is
-            continue
-        if not have_ect and lossy is None:
-            result[img.idx] = img.raw  # nothing to do without any optimizer
-            continue
-        base = img.raw
-        if have_ect:
-            tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
-                                        f".{img.kind}")
-            try:
-                with open(tmp, "wb") as fh:
-                    fh.write(img.raw)
-            except OSError:
-                result[img.idx] = img.raw
-                continue
-            _ect_squeeze(tmp, img.kind)
-            try:
-                with open(tmp, "rb") as fh:
-                    optimized = fh.read()
-            except OSError:
-                optimized = img.raw
-            # Guard against pessimization: keep the packed-smaller.
-            if 0 < _packed_cost(optimized) < _packed_cost(img.raw):
-                # The optimizer must return a complete image, not a truncated one.
-                if _looks_complete(img.kind, optimized):
-                    base = optimized
-                else:
-                    print(f"[warning] {img.img_id}: optimizer output failed validation, "
-                          f"kept original", file=sys.stderr)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        if Image is not None:
-            base = _try_lossless_variants(img, workdir, base, have_ect)
-        if lossy is not None and _lossy_tools_ok():
-            base = _try_lossy(img, workdir, lossy, base, lossy_marks)
-        result[img.idx] = base
+    if workers <= 1 or len(images) <= 1:
+        for img in images:
+            idx, final = _process_image(img, workdir, have_ect, lossy,
+                                        lossy_marks)
+            result[idx] = final
+        return result
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_process_image, img, workdir, have_ect, lossy,
+                          lossy_marks) for img in images]
+        for fut in futs:
+            idx, final = fut.result()
+            result[idx] = final
     return result
 
 
@@ -564,7 +646,7 @@ def _set_lossy_mark(attrs: str, target: float) -> str:
     try:
         new_attrs, n = re.subn(LOSSY_MARK + r'\s*=\s*"[0-9.]+"', stamp,
                                attrs, count=1)
-    except Exception:
+    except (TypeError, re.error):
         return attrs
     return new_attrs if n else f"{attrs} {stamp}"
 
@@ -634,7 +716,7 @@ def _token_bytes(text: str) -> int:
     try:
         return sum(len(m.group(0)) for m in
                    re.finditer(LOSSY_MARK + r"\[[^\]]*\]", text or ""))
-    except Exception:
+    except (TypeError, re.error):
         return 0
 
 
@@ -818,6 +900,8 @@ def _ect_squeeze(path: str, kind: str) -> None:
 
 def _encode_png_bytes(im, meta_from=None) -> bytes | None:
     """PIL PNG bytes, metadata-preserving. None on encode trouble."""
+    if im is None:
+        return None
     if meta_from is None:
         meta_from = im
     try:
@@ -860,12 +944,22 @@ def _exact_png_candidates(img: _Image, im) -> list[tuple[bytes, str]]:
     return cands
 
 
-def _exact_jpeg_candidates(img: _Image, im) -> list[tuple[bytes, str]]:
-    """Pixel-exact JPEG->PNG crossover for flat graphics.
+def _exact_crossover_candidates(img: _Image, im
+                                ) -> list[tuple[bytes, str]]:
+    """Pixel-exact re-encoding into PNG for JPEG and simple formats.
 
-    Skipped with EXIF/ICC aboard: PNG cannot carry them, and EXIF
-    orientation decides how readers show the file — never flip silently.
+    Flat graphics stored as JPEG (or BMP/PPM from sloppy converters)
+    often win as PNG. Skipped with EXIF/ICC aboard: PNG cannot carry
+    them, and EXIF orientation decides how readers show the file —
+    never flip silently. GIF stays out (animation lives frame by frame).
     """
+    if img.kind == "jpg":
+        pass
+    elif (img.kind not in ("png", "jpg", "gif")
+          and (im.format or "").upper() in GENERIC_SAFE_FORMATS):
+        pass
+    else:
+        return []
     if im.mode not in ("RGB", "L", "P"):
         return []
     if im.info.get("exif") or im.info.get("icc_profile"):
@@ -933,9 +1027,11 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
         if img.kind == "png":
             cands = _exact_png_candidates(img, im)
         elif img.kind == "jpg":
-            cands = _exact_jpeg_candidates(img, im)
+            cands = _exact_crossover_candidates(img, im)
+        elif (im.format or "").upper() in GENERIC_SAFE_FORMATS:
+            cands = _exact_crossover_candidates(img, im)
         else:
-            cands = []
+            cands = []  # gif and the truly exotic: keep as is
     except Exception:
         return base
     base_cost = _packed_cost(base)
@@ -952,12 +1048,20 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
 
 
 def _pil_open(raw: bytes):
-    """Decode image bytes with Pillow. None — not decodable."""
+    """Decode image bytes with Pillow. None — not decodable/too big."""
     if Image is None or not raw:
+        return None
+    if len(raw) > MAX_MEMBER_BYTES:
         return None
     try:
         im = Image.open(io.BytesIO(raw))
+        w, h = im.size
+        if w <= 0 or h <= 0 or w * h > MAX_IMAGE_PX:
+            return None
         im.load()
+        w2, h2 = im.size
+        if w2 * h2 > MAX_IMAGE_PX:
+            return None
         return im
     except Exception:
         return None
@@ -999,9 +1103,13 @@ def _ssim_score(ref_png: str, cand_png: str) -> float | None:
 def _save_png(im, path, meta_from=None) -> None:
     """Save PNG keeping text chunks and ICC profile when present.
 
+    No-op on None image (edge guard, never raises).
+
     Metadata is taken from meta_from (the source image) when given,
     else from im itself. Falls back to a plain save on any trouble.
     """
+    if im is None:
+        return
     src_im = meta_from if meta_from is not None else im
     kw: dict = {"optimize": True}
     if Image is not None and src_im is not None:
@@ -1274,7 +1382,8 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes,
 # --------------------------------------------------------------------------
 
 def optimize_fb2_payload(payload: bytes, workdir: str,
-                         have_ect: bool, lossy: float | None = None
+                         have_ect: bool, lossy: float | None = None,
+                         img_workers: int = 1
                          ) -> tuple[bytes, Fb2Stats]:
     """Optimize the bytes of one .fb2. Returns (new_bytes, stats).
 
@@ -1286,7 +1395,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     if payload is None:
         raise Fb2OptError("empty FB2 data")
     text, encoding = decode_fb2_payload(payload)
-    matches = list(BINARY_RE.finditer(text))
+    matches = list(_binary_matches(text))
 
     images: list[_Image] = []
     skeleton_parts: list[str] = []
@@ -1323,7 +1432,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     lossy_marks: list[int] = []
     optimized = optimize_images(images, workdir, have_ect, lossy,
-                                lossy_marks)
+                                lossy_marks, img_workers)
 
     stats = Fb2Stats(pics=len(images), skipped=skipped)
     blocks: dict[int, str] = {}
@@ -1341,6 +1450,8 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
                 if marked is not None and lossy >= marked:
                     stats.marked += 1
             continue
+        # Single-line bodies everywhere; the counter compares against the
+        # flattened original, so wrapping style never leaks into numbers.
         new_body = encode_body(final)
         blocks[img.idx] = new_body
         final_kind = detect_kind(final, "")
@@ -1354,7 +1465,7 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
             attrs = _set_content_type(attrs, final_kind)
         if attrs != raw_attrs:
             skeleton_late.append((img.img_id, attrs))
-        delta = img.orig_b64_len - len(new_body)
+        delta = _flat_b64_len(img.raw) - len(new_body)
         if img.kind == "png":
             stats.png_saved += delta
         elif img.kind == "jpg":
@@ -1416,10 +1527,7 @@ def _drop_tmp(tmp_path: str, registry: list[str]) -> None:
     so a book can never be removed through this path by mistake.
     """
     if not isinstance(tmp_path, str) or not os.path.basename(tmp_path).startswith(".fb2opt-"):
-        try:
-            registry.remove(tmp_path)
-        except ValueError:
-            pass
+        _reg_forget(registry, tmp_path)
         print(f"[warning] refusing to delete a non-temp file: {tmp_path}",
               file=sys.stderr)
         return
@@ -1427,10 +1535,7 @@ def _drop_tmp(tmp_path: str, registry: list[str]) -> None:
         os.unlink(tmp_path)
     except OSError:
         pass
-    try:
-        registry.remove(tmp_path)
-    except ValueError:
-        pass
+    _reg_forget(registry, tmp_path)
 
 
 def _find_vanished(before: dict[str, bool]) -> list[str]:
@@ -1448,10 +1553,44 @@ def _sweep_temps(registry: list[str]) -> None:
 
 
 def _umask() -> int:
-    """Current umask without changing it."""
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
+    """Current umask without changing it (thread-safe, computed once)."""
+    global _CACHED_UMASK
+    if _CACHED_UMASK is not None:
+        return _CACHED_UMASK
+    with _UMASK_LOCK:
+        if _CACHED_UMASK is not None:
+            return _CACHED_UMASK
+        try:
+            mask = os.umask(0)
+        except OSError:
+            return 0o022
+        try:
+            os.umask(mask)
+        except OSError:
+            pass
+        _CACHED_UMASK = mask
+        return mask
+
+
+def _reg_append(registry: list[str], path: str) -> None:
+    """Thread-safe registry append. Never raises."""
+    try:
+        with _REGISTRY_LOCK:
+            registry.append(path)
+    except Exception:
+        pass
+
+
+def _reg_forget(registry: list[str], path: str) -> None:
+    """Thread-safe registry remove. Never raises."""
+    try:
+        with _REGISTRY_LOCK:
+            try:
+                registry.remove(path)
+            except ValueError:
+                pass
+    except Exception:
+        pass
 
 
 def _fresh_info(arcname: str, src_path: str) -> zipfile.ZipInfo:
@@ -1476,7 +1615,7 @@ def _write_candidate(entries: list[tuple[zipfile.ZipInfo, bytes]],
         os.close(handle)
     except OSError as exc:
         raise Fb2OptError(f"no write access to {base_dir}: {exc}") from exc
-    registry.append(tmp_path)
+    _reg_append(registry, tmp_path)
     try:
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED,
                               compresslevel=9) as zout:
@@ -1519,6 +1658,11 @@ def _restore_member_comments(tmp_path: str, comments: dict[str, bytes]) -> bool:
     """
     if not tmp_path or not comments or not any(comments.values()):
         return True
+    try:
+        if os.path.getsize(tmp_path) > MAX_ARCHIVE_BYTES:
+            return False
+    except OSError:
+        return False
     try:
         with open(tmp_path, "rb") as fh:
             blob = fh.read()
@@ -1643,15 +1787,13 @@ def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
     if actual != new_size:
         raise Fb2OptError(f"result size mismatch after install "
                           f"(expected {new_size}, got {actual})")
-    try:
-        registry.remove(tmp_path)
-    except ValueError:
-        pass
+    _reg_forget(registry, tmp_path)
     return True, new_size
 
 
 def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
-                       registry: list[str], lossy: float | None = None
+                       registry: list[str], lossy: float | None = None,
+                       img_workers: int = 1
                        ) -> tuple[int, str]:
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
@@ -1664,7 +1806,21 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
     try:
         with zipfile.ZipFile(path, "r") as zin:
             archive_comment = zin.comment
-            members = [(info, zin.read(info.filename)) for info in zin.infolist()]
+            _infos = zin.infolist()
+            if len(_infos) > MAX_ARCHIVE_MEMBERS:
+                raise Fb2OptError(f"too many archive members ({len(_infos)})")
+            _total = 0
+            for _info in _infos:
+                try:
+                    _sz = _info.file_size
+                except AttributeError:
+                    _sz = 0
+                if _sz > MAX_MEMBER_BYTES:
+                    raise Fb2OptError(f"archive member too large ({_info.filename})")
+                _total += _sz
+                if _total > MAX_ARCHIVE_BYTES:
+                    raise Fb2OptError("archive too large")
+            members = [(info, zin.read(info.filename)) for info in _infos]
     except zipfile.BadZipFile as exc:
         raise Fb2OptError(f"broken ZIP: {exc}") from exc
     except OSError as exc:
@@ -1681,7 +1837,7 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
         if info.filename.lower().endswith(".fb2"):
             try:
                 new_data, member_stats = optimize_fb2_payload(
-                    data, img_workdir, have_ect, lossy)
+                    data, img_workdir, have_ect, lossy, img_workers)
             except Fb2OptError as exc:
                 raise Fb2OptError(f"{info.filename}: {exc}") from exc
             stats.add(member_stats)
@@ -1706,7 +1862,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
-                       registry: list[str], lossy: float | None = None
+                       registry: list[str], lossy: float | None = None,
+                       img_workers: int = 1
                        ) -> tuple[int, str]:
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
@@ -1721,7 +1878,7 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
     img_workdir = os.path.join(tmp_root, "img")
     new_payload, stats = optimize_fb2_payload(payload, img_workdir, have_ect,
-                                               lossy)
+                                               lossy, img_workers)
 
     target = abs_path + ".zip"
     entries = [(_fresh_info(os.path.basename(abs_path), abs_path), new_payload)]
@@ -1762,17 +1919,15 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
     except OSError as exc:
         _drop_tmp(tmp_path, registry)
         raise Fb2OptError(f"failed to write {target}: {exc}") from exc
-    try:
-        registry.remove(tmp_path)
-    except ValueError:
-        pass
+    _reg_forget(registry, tmp_path)
     _warn_skipped(name, stats)
     return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
                                  f"({stats.breakdown()}) → {os.path.basename(target)}")
 
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
-                   registry: list[str], lossy: float | None = None
+                   registry: list[str], lossy: float | None = None,
+                   img_workers: int = 1
                    ) -> tuple[int, str]:
     """Optimize a single file; errors come as Fb2OptError."""
     if not isinstance(path, str) or not path:
@@ -1785,10 +1940,10 @@ def _optimize_one(path: str, tmp_root: str, have_ect: bool,
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
         return optimize_zip_file(path, per_file_tmp, have_ect, registry,
-                                 lossy)
+                                 lossy, img_workers)
     if lowered.endswith(".fb2"):
         return optimize_fb2_file(path, per_file_tmp, have_ect, registry,
-                                 lossy)
+                                 lossy, img_workers)
     raise Fb2OptError("need .fb2 or .zip")
 
 
@@ -1805,7 +1960,7 @@ def _iter_fb2_payloads(sources: list[str]):
             print(f"[error] source not found: {src}", file=sys.stderr)
             continue
         if os.path.isdir(src):
-            for root, _, files in os.walk(src):
+            for root, _, files in os.walk(src, followlinks=False):
                 for fn in sorted(files):
                     if fn.lower().endswith((".fb2", ".zip")):
                         yield from _payloads_from_file(os.path.join(root, fn))
@@ -1860,7 +2015,7 @@ def cmd_extract(sources: list[str], out_dir: str, quiet: bool) -> int:
         except Fb2OptError as exc:
             print(f"[error] {src_path}: {exc}", file=sys.stderr)
             continue
-        for match in BINARY_RE.finditer(text):
+        for match in _binary_matches(text):
             attrs, body = match.group(1), match.group(2)
             id_match = ID_RE.search(attrs or "")
             raw = decode_body(body)
@@ -1891,8 +2046,15 @@ def cmd_extract(sources: list[str], out_dir: str, quiet: bool) -> int:
 # --------------------------------------------------------------------------
 
 def _find_replacement(img_id: str, img_dir: str) -> str | None:
-    """Find the image file for an id among neighbors. None — not found."""
+    """Find the image file for an id among neighbors. None — not found.
+
+    Traversal-safe: candidates that escape img_dir (absolute paths,
+    "..") are skipped, so a hostile book cannot read outside the folder. """
     if not img_id or not img_dir or not os.path.isdir(img_dir):
+        return None
+    try:
+        base = os.path.abspath(img_dir)
+    except OSError:
         return None
     stem, _ = os.path.splitext(img_id)
     candidates = [img_id,
@@ -1903,9 +2065,19 @@ def _find_replacement(img_id: str, img_dir: str) -> str | None:
         if not name or name in seen:
             continue
         seen.add(name)
-        full = os.path.join(img_dir, name)
-        if os.path.isfile(full):
-            return full
+        if os.path.isabs(name):
+            continue
+        full = os.path.abspath(os.path.join(base, name))
+        try:
+            if os.path.commonpath([full, base]) != base:
+                continue
+        except (ValueError, OSError):
+            continue
+        try:
+            if os.path.isfile(full):
+                return full
+        except OSError:
+            continue
     return None
 
 
@@ -1966,7 +2138,22 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
                       f"-> id='{id_match.group(1)}'")
             return f"<binary{attrs}>{encode_body(data)}</binary>"
 
-        new_text = BINARY_RE.sub(_replace, text)
+        ignored = _ignored_spans(text)
+        def _in_ignored(pos: int) -> bool:
+            for _s, _e in ignored:
+                if _s <= pos < _e:
+                    return True
+            return False
+        _parts: list[str] = []
+        _last = 0
+        for _m in BINARY_RE.finditer(text):
+            if _in_ignored(_m.start()):
+                continue
+            _parts.append(text[_last:_m.start()])
+            _parts.append(_replace(_m))
+            _last = _m.end()
+        _parts.append(text[_last:])
+        new_text = "".join(_parts)
         if updated == 0:
             if not quiet:
                 print(f"[info] {path}: no images to swap in {img_dir}")
@@ -2052,7 +2239,7 @@ def _expand_sources(files: list[str], recursive: bool) -> list[str]:
     expanded: list[str] = []
     for item in files:
         if recursive and isinstance(item, str) and os.path.isdir(item):
-            for root, _, names in os.walk(item):
+            for root, _, names in os.walk(item, followlinks=False):
                 for fn in sorted(names):
                     # Packed books only: foreign zips stay out (no
                     # "no .fb2 in the archive" noise), raw .fb2 files are
@@ -2079,49 +2266,73 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
               f"(pip install pillow; apt install ffmpeg)", file=sys.stderr)
         return 2
     expanded = _expand_sources(files, recursive)
-    failures = 0
-    total_saved = 0
     registry: list[str] = []
     # Census: fb2opt only ever replaces files in place, never deletes them.
     # If an input is gone when the batch is done, say so loudly.
     before = {path: os.path.lexists(path) for path in expanded
               if isinstance(path, str) and path}
+    # All cores, no flag: files across threads, images inside a file
+    # across threads too (images win when the batch is a single book).
+    cpus = _cpu_count()
+    file_workers = max(1, min(cpus, len(expanded)))
+    img_workers = max(1, cpus // max(1, len(expanded)))
 
-    def _one(path: str, tmp_root: str) -> None:
-        nonlocal failures, total_saved
+    def _one(path: str, tmp_root: str) -> tuple[int, str | None,
+                                               str | None, bool]:
+        """Optimize one file. Returns (saved, stdout, stderr, failed)."""
         try:
             saved, line = _optimize_one(path, tmp_root, have_ect, registry,
-                                        lossy)
+                                        lossy, img_workers)
         except Fb2OptError as exc:
-            print(f"[error] {path}: {exc}", file=sys.stderr)
-            failures += 1
-            return
+            return 0, None, f"[error] {path}: {exc}", True
         except Exception as exc:
-            # One bad file (encrypted/odd ZIP, bad disk) must not kill the batch.
-            print(f"[error] {path}: unexpected {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
-            failures += 1
-            return
-        total_saved += saved
-        if not quiet:
-            print(line)
+            # One bad file (encrypted/odd ZIP, bad disk) must not kill batch.
+            return (0, None,
+                    f"[error] {path}: unexpected {type(exc).__name__}: {exc}",
+                    True)
+        if quiet:
+            return saved, None, None, False
+        return saved, line, None, False
+
+    def _run_all(tmp_root: str) -> list[tuple[int, str | None,
+                                             str | None, bool]]:
+        if file_workers <= 1:
+            return [_one(path, tmp_root) for path in expanded]
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=file_workers)
+        try:
+            futs = [ex.submit(_one, path, tmp_root) for path in expanded]
+            return [fut.result() for fut in futs]
+        except KeyboardInterrupt:
+            for fut in futs:
+                fut.cancel()
+            ex.shutdown(wait=False)
+            raise
+        else:
+            ex.shutdown(wait=True)
 
     try:
         if keep_tmp:
             tmp_root = tempfile.mkdtemp(prefix="fb2opt-")
             if not quiet:
                 print(f"[debug] temp files: {tmp_root}")
-            for path in expanded:
-                _one(path, tmp_root)
+            results = _run_all(tmp_root)
         else:
             with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
-                for path in expanded:
-                    _one(path, tmp_root)
+                results = _run_all(tmp_root)
     except KeyboardInterrupt:
         _sweep_temps(registry)
         print("[interrupted]", file=sys.stderr)
         return 130
     _sweep_temps(registry)
+    failures = 0
+    total_saved = 0
+    for saved, outline, errline, failed in results:
+        failures += failed
+        total_saved += saved
+        if errline is not None:
+            print(errline, file=sys.stderr)
+        if outline is not None:
+            print(outline)
     for gone in _find_vanished(before):
         print(f"[error] {gone}: file disappeared during the run "
               f"(fb2opt never deletes books — restore it from backup "

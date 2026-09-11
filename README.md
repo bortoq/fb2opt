@@ -52,14 +52,21 @@ The first number is real saved bytes on disk. In brackets — the
 unpacked-FB2 breakdown by type: `xml` (markup), `png`, `jpg`
 (`other` appears only if such images exist). Only types with
 nonzero savings are shown. The bracket numbers always sum to
-the unpacked FB2 delta.
+the unpacked FB2 delta. Rewritten bodies are always single-line
+base64, and counters compare against the flattened original — so no
+wrapping style ever leaks into the numbers (a negative `png:`/`jpg:`
+only means the bytes genuinely grew while packing smaller —
+keeping the original would enlarge the archive).
 
 ## Safety notes
 
 - "Lossless" means pixels: default mode never changes a decoded pixel
   (every re-encoding is verified identical before it is kept). PNG text
   chunks and ICC profiles survive re-encoding; JPEG metadata (EXIF/ICC)
-  is stripped by design. Keep backups of books you care about.
+  is stripped by design. Project rule, enforced by tests: default mode
+  ships pixel-exact bytes or keeps the original — anything that cannot
+  be proven identical requires `--lossy`. Keep backups of books you
+  care about.
 - Originals are replaced only when the new file is smaller; replacement
   is atomic (`os.replace`), so a crash never leaves a half-written book.
 - Temp-file cleanup only ever deletes `fb2opt`'s own `.fb2opt-*.zip`
@@ -70,6 +77,9 @@ the unpacked FB2 delta.
   readers (early PocketBook/ONYX firmware, cheap hardware decoders) may
   open progressive JPEGs slowly or not at all. If you read on such
   a device, check one book first and keep a backup.
+- Uses all CPU cores automatically (books and images in parallel, no
+  flag); result bytes are identical to a sequential run. A parallel
+  batch holds several books in RAM at once.
 - Symlinks are skipped, never followed or replaced.
 - In-place optimization breaks hardlinks (the replaced file gets a new inode).
 - ZIP dates, permissions and comments are preserved. The final `ect -zip`
@@ -126,7 +136,8 @@ file itself and guarded by a metric — nothing is taken on faith.
 
 Even the default lossless mode re-encodes when it can prove
 pixel-identity: exact gray → L, palette slack trim, RGB→palette,
-few-color JPEG → PNG. A format change rewrites the `content-type`
+few-color JPEG → PNG, and stray BMP/PPM from sloppy converters → PNG.
+A format change rewrites the `content-type`
 of the `<binary>` block, so the markup stays honest.
 
 ## Text safety

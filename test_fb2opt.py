@@ -426,11 +426,12 @@ class TestBatch(unittest.TestCase):
             real_one = mod._optimize_one
 
             def deleting_one(path, tmp_root, have_ect, registry,
-                             lossy=None):
+                             lossy=None, img_workers=1):
                 if path == zp:
                     os.unlink(path)
                     return 0, "x: already optimal"
-                return real_one(path, tmp_root, have_ect, registry, lossy)
+                return real_one(path, tmp_root, have_ect, registry, lossy,
+                                img_workers)
             with mock.patch.object(mod, "_optimize_one", deleting_one):
                 err = io.StringIO()
                 with redirect_stderr(err):
@@ -741,7 +742,8 @@ class TestLossyBatchAndCli(unittest.TestCase):
             make_zip(zp, make_fb2())
             calls = {"n": 0}
 
-            def flaky(path, tmp_root, have_ect, registry, lossy=None):
+            def flaky(path, tmp_root, have_ect, registry, lossy=None,
+                      img_workers=1):
                 calls["n"] += 1
                 if "a.fb2" in path:
                     raise RuntimeError("boom")
@@ -1154,7 +1156,6 @@ def _text_png():
 
 
 @unittest.skipUnless(HAS_PIL, "Pillow missing")
-@unittest.skipUnless(HAS_PIL, "Pillow missing")
 class TestMetadataHonesty(unittest.TestCase):
     def _img(self, raw, kind):
         return mod._Image(idx=0, img_id="m", kind=kind, raw=raw,
@@ -1529,6 +1530,431 @@ class TestReopenedAndWrapper(unittest.TestCase):
         token = mod._render_lossy_token({"cover": 0.92})
         self.assertEqual(stats.marks, -(len(token) + 1))
         self.assertIn(b"Tool X " + token.encode(), new)
+
+
+
+
+
+class TestSingleLineBodies(unittest.TestCase):
+    def test_encode_is_single_line(self):
+        raw = bytes((i * 7) % 256 for i in range(300))
+        body = mod.encode_body(raw)
+        self.assertNotIn("\n", body)
+        self.assertEqual(mod.decode_body(body), raw)
+        self.assertEqual(len(body), (len(raw) + 2) // 3 * 4)
+        self.assertEqual(mod._flat_b64_len(raw), len(body))
+        self.assertEqual(mod._flat_b64_len(b""), 0)
+
+    def test_output_bodies_are_single_line(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        from PIL import Image as _I
+        import io as _io2
+        buf = _io2.BytesIO()
+        _I.new("RGB", (32, 32), (90, 90, 90)).save(buf, "PNG")
+        raw = buf.getvalue()
+        b64 = base64.b64encode(raw).decode()
+        wrapped = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+        fb2 = make_fb2(wrapped)
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False, None)
+        import re as _re
+        m = _re.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new, _re.DOTALL)
+        body = m.group(1).decode()
+        self.assertNotIn("\n", body)
+        # counter is exact: flattened original minus new body
+        self.assertEqual(stats.png_saved + stats.jpg_saved
+                         + stats.other_saved,
+                         len(b64) - len(body))
+        # idempotent: single line in, single line out
+        with tempfile.TemporaryDirectory() as d:
+            new2, _ = mod.optimize_fb2_payload(new, d, False, None)
+        self.assertEqual(new2, new)
+
+
+
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestParallelDeterminism(unittest.TestCase):
+    def test_workers_agree(self):
+        from PIL import Image as _I
+        import io as _io
+        raws = []
+        for i, (mode, color) in enumerate(
+                (("RGB", (200, 30, 30)), ("RGB", (40, 40, 40)),
+                 ("L", 128), ("P", 3))):
+            buf = _io.BytesIO()
+            _I.new(mode, (64, 64), color).save(buf, "PNG")
+            raws.append(buf.getvalue())
+        buf = _io.BytesIO()
+        _gradient(64, 64).save(buf, "JPEG", quality=90)
+        raws.append(buf.getvalue())
+        kinds = ["png", "png", "png", "png", "jpg"]
+        images = [mod._Image(idx=i, img_id=f"i{i}", kind=k, raw=r,
+                             orig_b64_len=10, attrs="", orig_body="")
+                  for i, (r, k) in enumerate(zip(raws, kinds))]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                seq = mod.optimize_images(images, d, True, None, None, 1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                par = mod.optimize_images(images, d, True, None, None, 4)
+        self.assertEqual(seq, par)
+
+
+
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestGenericFormats(unittest.TestCase):
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="g", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_bmp_crosses_to_png(self):
+        import io as _io
+        buf = _io.BytesIO()
+        _gradient(64, 64).save(buf, "BMP")
+        raw = buf.getvalue()
+        self.assertTrue(raw.startswith(b"BM"))
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(raw, "other"), d,
+                                             raw, False)
+        back = mod._pil_open(out)
+        self.assertEqual(back.format, "PNG")
+        self.assertLessEqual(mod._packed_cost(out), mod._packed_cost(raw))
+        self.assertTrue(mod._pixels_equal(out, raw))
+
+    def test_tiff_and_gif_stay(self):
+        from PIL import Image as _I
+        import io as _io
+        buf = _io.BytesIO()
+        _flat_two_color().save(buf, "TIFF")
+        raw = buf.getvalue()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(raw, "other"), d,
+                                           raw, False), raw)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(b"GIF89a...", "gif"), d,
+                                           b"GIF89a...", True),
+                b"GIF89a...")
+
+
+
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestDefaultPixelIdentity(unittest.TestCase):
+    """Architectural invariant: default mode never changes decoded pixels.
+
+    Whatever the heuristics do (gray, palette, crossover), the bytes they
+    install must decode to identical pixels — or the original stays.
+    """
+
+    def _cases(self):
+        from PIL import Image as _I
+        import io as _io
+
+        def _png(im, **kw):
+            buf = _io.BytesIO()
+            im.save(buf, "PNG", **kw)
+            return buf.getvalue()
+
+        def _jpg(im, **kw):
+            buf = _io.BytesIO()
+            im.save(buf, "JPEG", **kw)
+            return buf.getvalue()
+
+        gradient = _gradient(96, 96)
+        yield "rgb-photo-png", "png", _png(gradient)
+        yield "rgb-photo-jpg", "jpg", _jpg(gradient, quality=90)
+        yield "palette", "png", _png(
+            gradient.quantize(colors=64, method=_I.MEDIANCUT))
+        gray = _I.new("RGB", (48, 48), (110, 110, 110))
+        yield "gray-rgb", "png", _png(gray)
+        yield "gray-l", "png", _png(gray.convert("L"))
+        rgba = _I.new("RGBA", (32, 32), (10, 20, 30, 128))
+        yield "alpha", "png", _png(rgba)
+        yield "bilevel", "png", _png(gradient.convert("1"))
+        buf = _io.BytesIO()
+        gradient.save(buf, "BMP")
+        yield "bmp-as-other", "other", buf.getvalue()
+
+    def test_pixels_survive_default(self):
+        for name, kind, raw in self._cases():
+            img = mod._Image(idx=0, img_id=name, kind=kind, raw=raw,
+                             orig_b64_len=10, attrs="", orig_body="")
+            with tempfile.TemporaryDirectory() as d:
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    out = mod.optimize_images([img], d, True, None, None, 1)
+            self.assertTrue(mod._pixels_equal(out[0], raw),
+                            f"pixels changed: {name}")
+
+
+class TestAuditDirectCoverage(unittest.TestCase):
+    """Прямые тесты закрывают замечания аудита (по одному на функцию)."""
+
+    def test_run_tool_guards(self):
+        self.assertFalse(mod.run_tool([]))
+        self.assertFalse(mod.run_tool(["nonexistent-fb2opt-xyz-123"]))
+        self.assertTrue(mod.run_tool(["true"]))
+        with mock.patch.object(mod.subprocess, "run", side_effect=OSError("x")):
+            self.assertFalse(mod.run_tool(["ect", "f"]))
+
+    def test_cpu_umask_fresh_reg(self):
+        self.assertGreaterEqual(mod._cpu_count(), 1)
+        with mock.patch.object(mod.os, "cpu_count", side_effect=OSError("x")):
+            self.assertEqual(mod._cpu_count(), 1)
+        mod._CACHED_UMASK = None
+        m1 = mod._umask()
+        m2 = mod._umask()
+        self.assertEqual(m1, m2)
+        self.assertIsNotNone(mod._CACHED_UMASK)
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "s.fb2")
+            _write(src, "x")
+            info = mod._fresh_info("b.fb2", src)
+            self.assertEqual(info.filename, "b.fb2")
+            self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+        reg: list = []
+        mod._reg_append(reg, "a")
+        mod._reg_append(reg, "b")
+        self.assertEqual(reg, ["a", "b"])
+        mod._reg_forget(reg, "a")
+        mod._reg_forget(reg, "missing")
+        self.assertEqual(reg, ["b"])
+        # registry lock smoke across threads
+        import threading as _t
+        reg2: list = []
+        def _w(n):
+            for i in range(50):
+                mod._reg_append(reg2, f"{n}-{i}")
+        ths = [_t.Thread(target=_w, args=(n,)) for n in range(4)]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        self.assertEqual(len(reg2), 200)
+
+    def test_deps_helpers(self):
+        st = mod.dep_status()
+        self.assertEqual(len(st), 3)
+        self.assertTrue(all(len(r) == 3 for r in st))
+        with mock.patch.object(mod.shutil, "which", return_value=None):
+            with mock.patch.object(mod, "have_pil", return_value=False):
+                with mock.patch.object(mod, "have_ffmpeg", return_value=False):
+                    st2 = mod.dep_status()
+                    self.assertTrue(all(f is False for _, _, f in st2))
+                    self.assertIn("NOT FOUND", mod.format_deps())
+        self.assertIn("Dependencies", mod.format_deps())
+        self.assertIn("Usage", mod.short_hint())
+        self.assertIn("Dependencies", mod.short_hint())
+        self.assertTrue(mod.have_pil() if HAS_PIL else not mod.have_pil())
+        self.assertIsInstance(mod.have_ffmpeg(), bool)
+        with mock.patch.object(mod, "have_pil", return_value=True):
+            with mock.patch.object(mod, "have_ffmpeg", return_value=True):
+                self.assertTrue(mod._lossy_tools_ok())
+            with mock.patch.object(mod, "have_ffmpeg", return_value=False):
+                self.assertFalse(mod._lossy_tools_ok())
+
+    def test_gap_single_pass(self):
+        import re as _re
+        m = _re.match(r"(?s)(.*)", "")
+        # direct _gap_replace: right tag unconsumed (lookahead)
+        left = "<p>"
+        right = "<p>"
+        mm = mod.GAP_RE.search("</p>\n<p>")
+        self.assertIsNotNone(mm)
+        self.assertEqual(mod._gap_replace(mm), "</p>")
+        mm2 = mod.GAP_RE.search("</emphasis>\n<strong>")
+        self.assertEqual(mod._gap_replace(mm2), "</emphasis> ")
+        # chained gaps collapse in one pass O(N)
+        self.assertEqual(mod.minify_skeleton("<a>\n<b>\n<c>"), "<a><b><c>")
+        big = "<p>" + "</p>\n<p>" * 2000 + "x</p>"
+        out = mod.minify_skeleton(big)
+        self.assertNotIn("\n", out.replace("x", ""))
+        self.assertEqual(mod.minify_skeleton(""), "")
+
+    def test_ignored_spans(self):
+        txt = "<p>a</p><!-- <binary id='x'>AA==</binary> --><![CDATA[<binary id='y'>BB==</binary>]]><binary id='z'>CC==</binary>"
+        spans = mod._ignored_spans(txt)
+        self.assertEqual(len(spans), 2)
+        got = [m.group(1) for m in mod._binary_matches(txt)]
+        self.assertEqual(len(got), 1)
+        self.assertIn("z", got[0])
+        self.assertEqual(list(mod._binary_matches("")), [])
+        self.assertEqual(mod._ignored_spans(""), [])
+
+    def test_commented_binary_untouched(self):
+        b64 = base64.b64encode(PNG_1X1).decode()
+        fb2 = make_fb2(b64)
+        fb2s = fb2.decode("utf-8").replace("</FictionBook>",
+            "<!-- <binary id='ghost' content-type='image/png'>" + b64 + "</binary> --></FictionBook>")
+        fb2b = fb2s.encode("utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2b, d, False)
+        # comments are dropped by minify: ghost must not become pics=2
+        self.assertEqual(stats.pics, 1)
+        self.assertNotIn(b"__FB2OPT_", new)
+        self.assertNotIn(b"ghost", new)
+
+    def test_looks_complete(self):
+        self.assertTrue(mod._looks_complete("gif", b"anything"))
+        self.assertTrue(mod._looks_complete("other", b"x"))
+        self.assertFalse(mod._looks_complete("png", b""))
+        self.assertFalse(mod._looks_complete("jpg", b""))
+        self.assertTrue(mod._looks_complete("png", mod.PNG_MAGIC + b"x" + mod.PNG_TRAILER))
+        self.assertFalse(mod._looks_complete("png", mod.PNG_MAGIC + b"x"))
+        self.assertTrue(mod._looks_complete("jpg", mod.JPEG_MAGIC + b"x" + mod.JPEG_TRAILER))
+        self.assertFalse(mod._looks_complete("jpg", mod.JPEG_MAGIC + b"x"))
+
+    def test_process_image_guards(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = mod._Image(idx=0, img_id="e", kind="png", raw=b"", orig_b64_len=0, attrs="", orig_body="")
+            self.assertEqual(mod._process_image(img, d, True, None, None), (0, b""))
+            gif = mod._Image(idx=1, img_id="g", kind="gif", raw=b"GIF89a..", orig_b64_len=1, attrs="", orig_body="")
+            self.assertEqual(mod._process_image(gif, d, True, None, None)[1], b"GIF89a..")
+            other = mod._Image(idx=2, img_id="o", kind="other", raw=b"zz", orig_b64_len=1, attrs="", orig_body="")
+            self.assertEqual(mod._process_image(other, d, True, None, None)[1], b"zz")
+            with mock.patch.object(mod, "Image", None):
+                png = mod._Image(idx=3, img_id="p", kind="png", raw=PNG_1X1, orig_b64_len=1, attrs="", orig_body="")
+                self.assertEqual(mod._process_image(png, d, False, None, None)[1], PNG_1X1)
+
+    def test_set_token_legacy_project_write(self):
+        self.assertEqual(mod._set_lossy_mark("", 0.92), ' fb2opt-lossy="0.92"')
+        self.assertIn('0.85', mod._set_lossy_mark(' id="a" fb2opt-lossy="0.92"', 0.85))
+        self.assertIn('fb2opt-lossy', mod._set_lossy_mark(' id="a"', 0.9))
+        self.assertGreater(mod._token_bytes("a fb2opt-lossy[0.92:x] b"), 0)
+        self.assertEqual(mod._token_bytes("no token"), 0)
+        self.assertEqual(mod._token_bytes(""), 0)
+        txt = "<binary id='a' fb2opt-lossy=\"0.92\"/><binary id='b'/>"
+        out, n = mod._strip_legacy_marks(txt)
+        self.assertGreater(n, 0)
+        self.assertNotIn("fb2opt-lossy", out)
+        k, present = mod._project_lossy_marks("t", [], None)
+        self.assertEqual((k, present), ({}, set()))
+        # write token: reopened path + fallback path
+        imgs = [mod._Image(idx=0, img_id="cover", kind="png", raw=b"r", orig_b64_len=1, attrs=' id="cover"', orig_body="")]
+        base = ("<description><document-info><author><a/></author>"
+                "<program-used>X</program-used><date>2020</date></document-info></description>"
+                "<binary id=\"cover\">AA==</binary>")
+        known = {"cover": 0.95}
+        skel, old, new, reop = mod._write_lossy_token(base, dict(known), {"cover"}, imgs, {0}, 0.85, {0: ' id="cover"'})
+        self.assertEqual(reop, 1)
+        self.assertIn("fb2opt-lossy[0.85:cover]", skel)
+        skel2, _, _, _ = mod._write_lossy_token("<a/>", {}, set(), [], set(), 0.9, {})
+        self.assertEqual(skel2, "<a/>")
+
+    def test_encode_exact_squeeze_save_drop(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        from PIL import Image as _I
+        im = _I.new("RGB", (8, 8), (10, 20, 30))
+        enc = mod._encode_png_bytes(im, im)
+        self.assertTrue(enc.startswith(mod.PNG_MAGIC))
+        self.assertIsNone(mod._encode_png_bytes(None, None))
+        raw_g = _png_bytes(_solid("RGB", (16, 16), (50, 50, 50)))
+        img = mod._Image(idx=0, img_id="g", kind="png", raw=raw_g, orig_b64_len=1, attrs="", orig_body="")
+        cands = mod._exact_png_candidates(img, mod._pil_open(raw_g))
+        self.assertGreaterEqual(len(cands), 1)
+        # exif blocks crossover
+        crafted = _flat_two_color()
+        crafted.info["exif"] = b"x"
+        imgj = mod._Image(idx=0, img_id="j", kind="jpg", raw=b"r", orig_b64_len=1, attrs="", orig_body="")
+        self.assertEqual(mod._exact_crossover_candidates(imgj, crafted), [])
+        big = _I.new("RGB", (2000, 2000), "red")
+        self.assertEqual(mod._exact_crossover_candidates(imgj, big), [])
+        with tempfile.TemporaryDirectory() as d:
+            base = b"base-bytes"
+            cb, cost = mod._squeeze_candidate(img, d, base, "png", base, mod._packed_cost(base), False)
+            self.assertEqual(cb, base)
+            mod._drop_paths([os.path.join(d, "no-such"), ""])
+            # _save_png keeps text chunks
+            from PIL import PngImagePlugin as _P
+            t = _I.new("RGB", (8, 8), (1, 2, 3))
+            t.text = {"K": "V"}
+            buf = io.BytesIO()
+            mod._save_png(t, buf, meta_from=t)
+            self.assertTrue(buf.getvalue().startswith(mod.PNG_MAGIC))
+
+    def test_jpeg_ladder_gray_probe(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        raw = _jpeg_bytes(_gradient(32, 32), 95)
+        im = mod._pil_open(raw)
+        work, ref = mod._scale_pair(im)
+        with tempfile.TemporaryDirectory() as d:
+            stem = os.path.join(d, "s")
+            with mock.patch.object(mod, "_ssim_score", side_effect=[0.5, 0.999]):
+                hit = mod._jpeg_ladder(work, ref, stem, 0.99)
+            self.assertIsNotNone(hit)
+            with mock.patch.object(mod, "_ssim_score", return_value=0.1):
+                self.assertIsNone(mod._jpeg_ladder(work, ref, stem, 0.99))
+            self.assertIsNone(mod._jpeg_ladder(None, None, stem, 0.9))
+            g = mod._gray_probe_at(work, stem + "_ref.png", ref.size, stem, 70, 0.9999, [])
+            self.assertIsNone(g)
+
+    def test_iter_payloads_replacement(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(list(mod._iter_fb2_payloads([])), [])
+            self.assertEqual(list(mod._iter_fb2_payloads([None])), [])
+            zp = os.path.join(d, "b.fb2.zip")
+            make_zip(zp, make_fb2())
+            got = list(mod._iter_fb2_payloads([zp]))
+            self.assertEqual(len(got), 1)
+            bad = os.path.join(d, "bad.zip")
+            _write(bad, b"junk", "wb")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(list(mod._payloads_from_file(bad)), [])
+            self.assertIn("error", err.getvalue().lower())
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(list(mod._payloads_from_file(os.path.join(d, "no.txt"))), [])
+            # traversal guard
+            imgdir = os.path.join(d, "img")
+            os.makedirs(imgdir)
+            _write(os.path.join(imgdir, "ok.png"), "x")
+            self.assertTrue(mod._find_replacement("ok", imgdir).endswith("ok.png"))
+            self.assertIsNone(mod._find_replacement("../ok", imgdir))
+            self.assertIsNone(mod._find_replacement("/etc/passwd", imgdir))
+            self.assertIsNone(mod._find_replacement("", imgdir))
+            self.assertIsNone(mod._find_replacement("ok", os.path.join(d, "no-dir")))
+
+    def test_limits_and_validate(self):
+        self.assertGreater(mod.MAX_ARCHIVE_BYTES, 0)
+        self.assertGreater(mod.MAX_MEMBER_BYTES, 0)
+        self.assertGreater(mod.MAX_IMAGE_PX, 0)
+        self.assertIsNone(mod.decode_body("ab!cd"))
+        self.assertEqual(mod.decode_body(base64.b64encode(b"hi").decode()), b"hi")
+        self.assertEqual(mod._flat_b64_len(b""), 0)
+        self.assertEqual(mod._packed_cost(b""), 0)
+        if HAS_PIL:
+            self.assertIsNone(mod._pil_open(b"x" * (mod.MAX_MEMBER_BYTES + 1)))
+        with tempfile.TemporaryDirectory() as d:
+            zp = os.path.join(d, "c.zip")
+            with zipfile.ZipFile(zp, "w") as z:
+                z.writestr("a", b"1")
+            self.assertFalse(mod._restore_member_comments(os.path.join(d, "missing.zip"), {"a": b"c"}))
+        # archive too large pre-check via fake infos
+        with tempfile.TemporaryDirectory() as d:
+            zp = os.path.join(d, "big.fb2.zip")
+            make_zip(zp, make_fb2())
+            real_zf = zipfile.ZipFile
+            class _FakeInfo:
+                filename = "book.fb2"
+                file_size = mod.MAX_MEMBER_BYTES + 1
+                def __init__(self): pass
+            class _FakeZip:
+                comment = b""
+                def __init__(self, *a, **k): pass
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def infolist(self): return [_FakeInfo()]
+            with mock.patch.object(mod.zipfile, "ZipFile", _FakeZip):
+                with self.assertRaises(mod.Fb2OptError):
+                    mod.optimize_zip_file(zp, tempfile.mkdtemp(dir=d), False, [])
+
 
 
 if __name__ == "__main__":

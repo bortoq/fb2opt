@@ -1,0 +1,27 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        pillow: ["nopillow", "pillow"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install pillow (full suite)
+        if: matrix.pillow == 'pillow'
+        run: pip install pillow
+      # No ect/ffmpeg here on purpose: the suite is hermetic without them
+      # (external tools are mocked; real-tool paths skip when absent).
+      # Tool-backed coverage runs on maintainer machines, not in CI.
+      - name: syntax check
+        run: python3 -m py_compile fb2opt test_fb2opt.py
+      - name: unit tests
+        run: python3 test_fb2opt.py
