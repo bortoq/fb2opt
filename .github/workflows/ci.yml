@@ -20,8 +20,44 @@ jobs:
         run: pip install pillow
       # No ect/ffmpeg here on purpose: the suite is hermetic without them
       # (external tools are mocked; real-tool paths skip when absent).
-      # Tool-backed coverage runs on maintainer machines, not in CI.
+      # Byte-level coverage with real ect lives in the byte-gate job below.
       - name: syntax check
         run: python3 -m py_compile fb2opt test_fb2opt.py
       - name: unit tests
+        run: python3 test_fb2opt.py
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Gate on F/B/UP only: E501/SIM117 and friends are accepted tech
+      # debt (mass reformat out of scope); ruff pinned for determinism.
+      - name: ruff F/B/UP gate
+        run: |
+          pip install "ruff==0.15.*"
+          ruff check --isolated --select F,B,UP fb2opt test_fb2opt.py
+
+  byte-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install pillow
+        run: pip install pillow
+      # Real ect 0.9.5 from source: catches byte-level regressions
+      # (like v4.9 --reuse) that hermetic tests cannot see.
+      - name: build ect
+        run: |
+          git clone --depth 1 --branch v0.9.5 \
+            https://github.com/fhanau/Efficient-Compression-Tool.git /tmp/ect
+          cd /tmp/ect && git submodule update --init --recursive
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+          echo "$(dirname "$(find /tmp/ect/build -name ect -type f | head -1)")" >> "$GITHUB_PATH"
+      - name: byte-gate suite (real ect)
         run: python3 test_fb2opt.py

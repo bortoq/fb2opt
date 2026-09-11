@@ -40,7 +40,7 @@ def make_fb2(png_b64=None, extra_binaries="", body_text="<p>Hello</p>"):
             "<p>Keep   spaces   here</p>"
             "</section></body>"
             f"<binary id=\"cover\" content-type=\"image/png\">{png_b64}</binary>"
-            f"{extra_binaries}</FictionBook>").encode("utf-8")
+            f"{extra_binaries}</FictionBook>").encode()
 
 
 def _write(path, data, mode="w"):
@@ -146,7 +146,7 @@ class TestPureHelpers(unittest.TestCase):
         self.assertEqual(s.breakdown(), "xml: 5, png: 3")
 
     def test_decode_payload_encodings(self):
-        t, enc = mod.decode_fb2_payload("привет".encode("utf-8"))
+        t, enc = mod.decode_fb2_payload("привет".encode())
         self.assertEqual((t, enc), ("привет", "utf-8"))
         t, enc = mod.decode_fb2_payload("привет".encode("cp1251"))
         self.assertEqual(enc, "cp1251")
@@ -557,7 +557,6 @@ class TestLossySearch(unittest.TestCase):
                     mod._lossy_jpeg(mod._pil_open(raw), img, d, 0.99))
 
     def test_jpeg_skips_cmyk(self):
-        from PIL import Image as _I
         raw = _jpeg_bytes(_gradient().convert("CMYK"))
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(mod._lossy_variant(self._img(raw, "jpg"), d, 0.9))
@@ -697,7 +696,6 @@ class TestLossyBatchAndCli(unittest.TestCase):
         self.assertIn(mod.VERSION, buf.getvalue())
 
     def test_bare_r_walks_cwd(self):
-        import contextlib
         with tempfile.TemporaryDirectory() as d:
             make_zip(os.path.join(d, "b.fb2.zip"), make_fb2())
             sub = os.path.join(d, "sub")
@@ -716,7 +714,6 @@ class TestLossyBatchAndCli(unittest.TestCase):
 
     @unittest.skipUnless(HAS_PIL, "Pillow missing")
     def test_lossy_on_zip_book(self):
-        from PIL import Image as _I
         import io as _io
         buf = _io.BytesIO()
         _gradient(200, 200).save(buf, "JPEG", quality=95)
@@ -1020,7 +1017,6 @@ class TestLosslessVariants(unittest.TestCase):
                                            b"junk", True), b"junk")
 
     def test_jpeg_graphic_tries_png(self):
-        from PIL import Image as _I
         im = _flat_two_color()
         raw = _jpeg_bytes(im, 85)
         img = self._img(raw, "jpg")
@@ -1175,7 +1171,6 @@ class TestMetadataHonesty(unittest.TestCase):
         self.assertTrue(mod._pixels_equal(out, raw))
 
     def test_exif_blocks_jpeg_to_png(self):
-        from PIL import Image as _I
         crafted = _flat_two_color()
         crafted.info["exif"] = b"fake-exif"
         raw = _jpeg_bytes(_flat_two_color(), 90)
@@ -1584,7 +1579,7 @@ class TestParallelDeterminism(unittest.TestCase):
         from PIL import Image as _I
         import io as _io
         raws = []
-        for i, (mode, color) in enumerate(
+        for _, (mode, color) in enumerate(
                 (("RGB", (200, 30, 30)), ("RGB", (40, 40, 40)),
                  ("L", 128), ("P", 3))):
             buf = _io.BytesIO()
@@ -1594,9 +1589,9 @@ class TestParallelDeterminism(unittest.TestCase):
         _gradient(64, 64).save(buf, "JPEG", quality=90)
         raws.append(buf.getvalue())
         kinds = ["png", "png", "png", "png", "jpg"]
-        images = [mod._Image(idx=i, img_id=f"i{i}", kind=k, raw=r,
+        images = [mod._Image(idx=i, img_id=f"i{i}", kind=kinds[i], raw=r,
                              orig_b64_len=10, attrs="", orig_body="")
-                  for i, (r, k) in enumerate(zip(raws, kinds))]
+                  for i, r in enumerate(raws)]
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(mod, "run_tool", lambda cmd: True):
                 seq = mod.optimize_images(images, d, True, None, None, 1)
@@ -1630,7 +1625,6 @@ class TestGenericFormats(unittest.TestCase):
         self.assertTrue(mod._pixels_equal(out, raw))
 
     def test_tiff_and_gif_stay(self):
-        from PIL import Image as _I
         import io as _io
         buf = _io.BytesIO()
         _flat_two_color().save(buf, "TIFF")
@@ -1767,11 +1761,7 @@ class TestAuditDirectCoverage(unittest.TestCase):
                 self.assertFalse(mod._lossy_tools_ok())
 
     def test_gap_single_pass(self):
-        import re as _re
-        m = _re.match(r"(?s)(.*)", "")
         # direct _gap_replace: right tag unconsumed (lookahead)
-        left = "<p>"
-        right = "<p>"
         mm = mod.GAP_RE.search("</p>\n<p>")
         self.assertIsNotNone(mm)
         self.assertEqual(mod._gap_replace(mm), "</p>")
@@ -1879,7 +1869,6 @@ class TestAuditDirectCoverage(unittest.TestCase):
             self.assertEqual(cb, base)
             mod._drop_paths([os.path.join(d, "no-such"), ""])
             # _save_png keeps text chunks
-            from PIL import PngImagePlugin as _P
             t = _I.new("RGB", (8, 8), (1, 2, 3))
             t.text = {"K": "V"}
             buf = io.BytesIO()
@@ -1948,7 +1937,6 @@ class TestAuditDirectCoverage(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             zp = os.path.join(d, "big.fb2.zip")
             make_zip(zp, make_fb2())
-            real_zf = zipfile.ZipFile
             class _FakeInfo:
                 filename = "book.fb2"
                 file_size = mod.MAX_MEMBER_BYTES + 1
@@ -2003,21 +1991,27 @@ class TestVariantChains(unittest.TestCase):
             p = os.path.join(d, "a.png")
             _write(p, mod.PNG_MAGIC + b"x" * 100 + mod.PNG_TRAILER, "wb")
             seen: list = []
-            def fake(cmd):
+            def fake_rewrite(cmd):
                 seen.append(cmd)
+                if cmd[0] == "oxipng":
+                    with open(cmd[-1], "ab") as fh:  # simulate rewrite
+                        fh.write(b"z")
                 return True
             with mock.patch.object(mod, "have_oxipng", return_value=True):
                 with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
-                    with mock.patch.object(mod, "run_tool", fake):
+                    with mock.patch.object(mod, "run_tool", fake_rewrite):
                         mod._ect_squeeze(p, "png")
             self.assertEqual(seen[0][:3], ["oxipng", "-o", "4"])
             self.assertNotIn("--strip", seen[0])  # chunks (text/ICC) must survive
             self.assertEqual(seen[1][:3], ["ect", "-9", "--reuse"])
             # no oxipng, old ect: plain -9, still no -progressive
             seen.clear()
+            def fake_plain(cmd):
+                seen.append(cmd)
+                return True
             with mock.patch.object(mod, "have_oxipng", return_value=False):
                 with mock.patch.object(mod, "_ect_reuse_ok", return_value=False):
-                    with mock.patch.object(mod, "run_tool", fake):
+                    with mock.patch.object(mod, "run_tool", fake_plain):
                         mod._ect_squeeze(p, "png")
             self.assertEqual(seen, [["ect", "-9", p]])
             # oxipng failure: ect still runs
@@ -2041,13 +2035,14 @@ class TestVariantChains(unittest.TestCase):
             def fake(cmd):
                 seen.append(cmd)
                 return True
-            # oxipng absent, ect supports --reuse -> plain -9, no --reuse
+            # oxipng absent, ect supports --reuse -> plain -9 runs first
+            # on pristine bytes (small file then also tries --reuse)
             with mock.patch.object(mod, "have_oxipng", return_value=False):
                 with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
                     with mock.patch.object(mod, "run_tool", fake):
                         mod._ect_squeeze(p, "png")
-            self.assertEqual(seen, [["ect", "-9", p]])
-            # oxipng present but failed -> plain -9, no --reuse
+            self.assertEqual(seen[0], ["ect", "-9", p])
+            # oxipng present but failed -> first ect is plain -9, no --reuse
             seen.clear()
             def flaky(cmd):
                 seen.append(cmd)
@@ -2056,8 +2051,8 @@ class TestVariantChains(unittest.TestCase):
                 with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
                     with mock.patch.object(mod, "run_tool", flaky):
                         mod._ect_squeeze(p, "png")
-            self.assertEqual([c[0] for c in seen], ["oxipng", "ect"])
-            self.assertNotIn("--reuse", seen[1])
+            self.assertEqual(seen[0][0], "oxipng")
+            self.assertEqual(seen[1], ["ect", "-9", p])
 
     def test_jpg_chain_and_finish_guards(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2165,6 +2160,126 @@ class TestBatchProgress(unittest.TestCase):
             outlines = [k for a, k in calls if a and "already optimal" in str(a[0])]
             self.assertTrue(outlines)
             self.assertTrue(all(k.get("flush") is True for k in outlines))
+
+
+class TestBothModes(unittest.TestCase):
+    """Оба режима ect на мелких PNG: побеждает packed-smaller, оригинал цел."""
+
+    def _png(self, body):
+        return mod.PNG_MAGIC + body + mod.PNG_TRAILER
+
+    def test_keeps_packed_smaller(self):
+        import random as _rnd
+        rng = _rnd.Random(11)
+        small = self._png(b"\0" * 2000)  # packed tiny
+        big = self._png(rng.randbytes(2000) + mod.PNG_TRAILER)  # packed huge
+        big = self._png(rng.randbytes(2000))
+        self.assertLess(mod._packed_cost(small), mod._packed_cost(big))
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            # reuse wins
+            _write(p, big, "wb")
+            def fake_reuse_wins(cmd):
+                if cmd[:2] == ["ect", "-9"]:
+                    _write(cmd[-1], small, "wb")
+                else:
+                    _write(cmd[-1], big, "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake_reuse_wins):
+                mod._ect_png_both(p)
+            self.assertEqual(open(p, "rb").read(), small)
+            # plain wins
+            _write(p, big, "wb")
+            def fake_plain_wins(cmd):
+                if cmd == ["ect", "-9", p]:
+                    _write(cmd[-1], small, "wb")
+                else:
+                    _write(cmd[-1], big, "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake_plain_wins):
+                mod._ect_png_both(p)
+            self.assertEqual(open(p, "rb").read(), small)
+
+    def test_tie_keeps_plain(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            orig = self._png(b"q" * 500)
+            _write(p, orig, "wb")
+            def fake_same(cmd):
+                _write(cmd[-1], self._png(b"w" * 500), "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake_same):
+                mod._ect_png_both(p)
+            got = open(p, "rb").read()
+            self.assertEqual(got, self._png(b"w" * 500))
+
+    def test_failure_restores_original(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            orig = self._png(b"z" * 500)
+            _write(p, orig, "wb")
+            with mock.patch.object(mod, "run_tool", return_value=False):
+                mod._ect_png_both(p)
+            self.assertEqual(open(p, "rb").read(), orig)
+            mod._ect_png_both(os.path.join(d, "missing.png"))
+            mod._ect_png_both("")
+            self.assertTrue(mod._is_small_png(p))
+            self.assertFalse(mod._is_small_png(os.path.join(d, "missing.png")))
+            self.assertFalse(mod._is_small_png(""))
+
+    def test_skipped_when_big(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.png")
+            _write(p, self._png(b"v" * (mod.SMALL_PNG_BOTH + 100)), "wb")
+            seen: list = []
+            def fake(cmd):
+                seen.append(cmd)
+                return True
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod, "run_tool", fake):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual(seen, [["ect", "-9", p]])
+
+
+def _gate_png(w=256, h=256):
+    import struct as _s
+    import zlib as _z
+    def _chunk(tag, data):
+        head = tag + data
+        return (_s.pack(">I", len(data)) + head
+                + _s.pack(">I", _z.crc32(head) & 0xFFFFFFFF))
+    ihdr = _s.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)  # filter None everywhere: non-optimal input
+        for x in range(w):
+            raw += bytes(((x * 3 + y) % 256, (x + y * 7) % 256,
+                          (x * 13 + y * 11) % 256))
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", _z.compress(bytes(raw), 6)) + _chunk(b"IEND", b""))
+
+
+@unittest.skipUnless(HAVE_ECT, "need real ect")
+class TestByteGate(unittest.TestCase):
+    """Байтовый гейт: цепочка обязана бить голый --reuse (регресс v4.9)."""
+
+    def test_chain_beats_reuse_only(self):
+        raw = _gate_png()
+        with tempfile.TemporaryDirectory() as d:
+            ref = os.path.join(d, "ref.png")
+            _write(ref, raw, "wb")
+            self.assertTrue(mod.run_tool(["ect", "-9", "--reuse", ref]))
+            with open(ref, "rb") as fh:
+                reuse = fh.read()
+            img = mod._Image(idx=0, img_id="g", kind="png", raw=raw,
+                             orig_b64_len=10, attrs="", orig_body="")
+            res = mod.optimize_images([img], d, True)
+            self.assertLess(mod._packed_cost(res[0]),
+                            mod._packed_cost(reuse))
+            self.assertLess(len(res[0]), len(raw))
+            if HAS_PIL:
+                self.assertTrue(mod._pixels_equal(res[0], raw))
 
 
 if __name__ == "__main__":

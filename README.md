@@ -4,7 +4,9 @@ Optimization of FB2 books packed as `.fb2.zip`. One Python script, no install ne
 
 What it does:
 
-- recompresses embedded images without quality loss (`ect`: PNG via `-9`, JPEG via `-9 -strip -progressive`);
+- recompresses embedded images without quality loss (`ect`: PNG via `-9`, JPEG via `-9 -strip -progressive`;
+  with `oxipng` installed its reductions run first and `ect --reuse` follows only their output, tiny PNGs try both modes;
+  with `jpegtran` installed JPEGs get one extra entropy pass);
 - minifies XML markup (drops comments and extra whitespace);
 - repacks the ZIP at max compression and runs `ect -zip` over it.
 

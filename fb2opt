@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """fb2opt — lossless optimization of FB2 books (.fb2.zip).
 
 One file, three modes:
@@ -34,7 +33,7 @@ import time
 import uuid
 import zipfile
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from urllib.parse import quote, unquote
 
@@ -66,7 +65,7 @@ INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
 
 DEPS: tuple[tuple[str, str], ...] = (
     ("ect", "lossless PNG / JPEG / ZIP"),
-    ("oxipng", "PNG reductions before ect --reuse (optional)"),
+    ("oxipng", "PNG reductions; ect --reuse runs only on its output (optional)"),
     ("jpegtran", "JPEG entropy finish after ect (optional)"),
     ("Pillow", "lossy JPEG / PNG encoding (with --lossy only)"),
     ("ffmpeg", "lossy quality metric SSIM (with --lossy only)"),
@@ -88,6 +87,7 @@ LOSSY_PNG_MAX_PX = 2000000  # JPEG->PNG crossover bound (keeps ect -9 fast)
 GRAY_PROBE_SCORE = 6.0  # below this mean chroma: one extra L-mode probe
 ECT_FAST_BYTES = 300000  # below this an ect pass is instant: always try
 CLOSE_RATIO = 1.2  # ect only gets its chance within 20% of packed base
+SMALL_PNG_BOTH = 256 * 1024  # both ect modes only while cheap (audit: tricky +55B)
 
 LOSSY_DEFAULT_SSIM = 0.92
 
@@ -125,7 +125,7 @@ class Fb2Stats:
     marks: int = 0  # annotation bytes saved (+) or spent (-) on lossy marks
     reopened: int = 0  # stamped images re-opened at a stricter target
 
-    def add(self, other: "Fb2Stats") -> None:
+    def add(self, other: Fb2Stats) -> None:
         self.marked += other.marked
         self.marks += other.marks
         self.reopened += other.reopened
@@ -964,21 +964,86 @@ def _jpegtran_finish(path: str) -> None:
             pass
 
 
+def _is_small_png(path: str) -> bool:
+    """File exists and fits the both-modes budget. Never raises."""
+    try:
+        return 0 <= os.path.getsize(path) <= SMALL_PNG_BOTH
+    except OSError:
+        return False
+
+
+def _ect_png_both(path: str) -> None:
+    """Plain -9 and --reuse on pristine bytes, keep packed-smaller.
+
+    --reuse is not always worse (audit: tricky +55B), so on small files
+    both passes are milliseconds — try both, keep the winner. Never raises.
+    """
+    try:
+        with open(path, "rb") as fh:
+            orig = fh.read()
+    except OSError:
+        return
+    if not _looks_complete("png", orig):
+        return
+    run_tool(["ect", "-9", path])
+    try:
+        with open(path, "rb") as fh:
+            plain = fh.read()
+    except OSError:
+        plain = b""
+    try:
+        with open(path, "wb") as fh:
+            fh.write(orig)
+    except OSError:
+        return
+    run_tool(["ect", "-9", "--reuse", path])
+    try:
+        with open(path, "rb") as fh:
+            reuse = fh.read()
+    except OSError:
+        reuse = b""
+    best = orig
+    for cand in (plain, reuse):
+        if (cand and _looks_complete("png", cand)
+                and 0 < _packed_cost(cand) < _packed_cost(best)):
+            best = cand
+    try:
+        with open(path, "wb") as fh:
+            fh.write(best)
+    except OSError:
+        pass
+
+
 def _ect_squeeze(path: str, kind: str) -> None:
     """Lossless external passes for the image kind. Never raises.
 
     PNG: oxipng reductions first (keeps all chunks by default, so text
-    and ICC survive), then ect recompresses the IDAT (--reuse keeps the
-    filters oxipng chose). JPEG: ect, then a jpegtran entropy finish.
-    Every stage is optional: missing tools are simply skipped. """
+    and ICC survive), then ect recompresses the IDAT (--reuse only on
+    bytes oxipng demonstrably rewrote). Small files also try plain -9
+    against --reuse and keep the winner. JPEG: ect, then a jpegtran
+    entropy finish. Every stage is optional: missing tools are skipped. """
     if kind == "png":
-        # --reuse keeps the file's filters: only valid when oxipng has
-        # just chosen them (and only when its run actually succeeded).
-        # Without oxipng the file carries the original filters and plain
+        # --reuse keeps the file's filters: valid only after oxipng
+        # demonstrably rewrote the file (size change), not merely exit 0
+        # (audit 4.2: untouched file + --reuse replays the P1 regression).
+        # Without oxipng output the original filters stay and plain
         # ect -9 compresses ~2-7x better (external audit P1, reproduced).
-        oxi_ok = run_tool(["oxipng", "-o", "4", path]) if have_oxipng() else False
-        if oxi_ok and _ect_reuse_ok():
+        changed = False
+        if have_oxipng():
+            try:
+                before = os.path.getsize(path)
+            except OSError:
+                before = -1
+            if run_tool(["oxipng", "-o", "4", path]):
+                try:
+                    after = os.path.getsize(path)
+                except OSError:
+                    after = -2
+                changed = before >= 0 and after != before
+        if changed and _ect_reuse_ok():
             run_tool(["ect", "-9", "--reuse", path])
+        elif _ect_reuse_ok() and _is_small_png(path):
+            _ect_png_both(path)
         else:
             run_tool(["ect", "-9", path])
     else:
@@ -2228,8 +2293,8 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
             return f"<binary{attrs}>{encode_body(data)}</binary>"
 
         ignored = _ignored_spans(text)
-        def _in_ignored(pos: int) -> bool:
-            for _s, _e in ignored:
+        def _in_ignored(pos: int, _spans: tuple = tuple(ignored)) -> bool:
+            for _s, _e in _spans:
                 if _s <= pos < _e:
                     return True
             return False
