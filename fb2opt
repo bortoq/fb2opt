@@ -66,6 +66,8 @@ INLINE_TAGS = frozenset({"a", "code", "emphasis", "image", "strikethrough",
 
 DEPS: tuple[tuple[str, str], ...] = (
     ("ect", "lossless PNG / JPEG / ZIP"),
+    ("oxipng", "PNG reductions before ect --reuse (optional)"),
+    ("jpegtran", "JPEG entropy finish after ect (optional)"),
     ("Pillow", "lossy JPEG / PNG encoding (with --lossy only)"),
     ("ffmpeg", "lossy quality metric SSIM (with --lossy only)"),
 )
@@ -100,6 +102,7 @@ MAX_IMAGE_PX = 50_000_000  # decoded pixels per image (~50 MP)
 _UMASK_LOCK = threading.Lock()
 _CACHED_UMASK: int | None = None
 _REGISTRY_LOCK = threading.Lock()
+_PRINT_LOCK = threading.Lock()
 
 
 class Fb2OptError(Exception):
@@ -372,6 +375,39 @@ def have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def have_oxipng() -> bool:
+    """oxipng available (PNG reductions chained before ect)."""
+    return shutil.which("oxipng") is not None
+
+
+def have_jpegtran() -> bool:
+    """jpegtran available (JPEG entropy finish after ect)."""
+    return shutil.which("jpegtran") is not None
+
+
+_ECT_REUSE_OK: bool | None = None
+
+
+def _ect_reuse_ok() -> bool:
+    """Installed ect understands --reuse (probed once, cached). Never raises."""
+    global _ECT_REUSE_OK
+    if _ECT_REUSE_OK is not None:
+        return _ECT_REUSE_OK
+    try:
+        done = subprocess.run(["ect", "-help"], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        _ECT_REUSE_OK = False
+        return False
+    try:
+        out = bytes(done.stdout or b"")
+    except (TypeError, AttributeError):
+        _ECT_REUSE_OK = False
+        return False
+    _ECT_REUSE_OK = b"--reuse" in out
+    return _ECT_REUSE_OK
+
+
 def _lossy_tools_ok() -> bool:
     """Everything --lossy needs: Pillow to encode, ffmpeg to measure."""
     return have_pil() and have_ffmpeg()
@@ -379,6 +415,8 @@ def _lossy_tools_ok() -> bool:
 
 _DEP_CHECKS = {
     "ect": lambda: shutil.which("ect") is not None,
+    "oxipng": lambda: have_oxipng(),
+    "jpegtran": lambda: have_jpegtran(),
     "Pillow": lambda: have_pil(),
     "ffmpeg": lambda: have_ffmpeg(),
 }
@@ -890,12 +928,60 @@ LOSSY_PNG_LADDER = (64, 128, 192)
 SSIM_TIMEOUT = 120
 
 
+def _jpegtran_finish(path: str) -> None:
+    """Extra lossless entropy pass (mozjpeg/jpegtran). Never raises.
+
+    Runs after ect on a temp copy and moves it back only when valid:
+    the original is never lost through this path. """
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        handle, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                                        prefix=".fb2opt-jt-", suffix=".jpg")
+        os.close(handle)
+    except OSError:
+        return
+    try:
+        ok = run_tool(["jpegtran", "-optimize", "-progressive",
+                       "-copy", "none", "-outfile", tmp, path])
+        if not ok:
+            return
+        try:
+            with open(tmp, "rb") as fh:
+                out = fh.read()
+        except OSError:
+            return
+        if _looks_complete("jpg", out):
+            try:
+                os.replace(tmp, path)
+            except OSError:
+                pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _ect_squeeze(path: str, kind: str) -> None:
-    """One lossless ect pass for the image kind. Never raises."""
+    """Lossless external passes for the image kind. Never raises.
+
+    PNG: oxipng reductions first (keeps all chunks by default, so text
+    and ICC survive), then ect recompresses the IDAT (--reuse keeps the
+    filters oxipng chose). JPEG: ect, then a jpegtran entropy finish.
+    Every stage is optional: missing tools are simply skipped. """
     if kind == "png":
-        run_tool(["ect", "-9", path])
+        if have_oxipng():
+            run_tool(["oxipng", "-o", "4", path])
+        if _ect_reuse_ok():
+            run_tool(["ect", "-9", "--reuse", path])
+        else:
+            run_tool(["ect", "-9", path])
     else:
         run_tool(["ect", "-9", "-strip", "-progressive", path])
+        if have_jpegtran():
+            _jpegtran_finish(path)
 
 
 def _encode_png_bytes(im, meta_from=None) -> bytes | None:
@@ -2258,7 +2344,7 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
     have_ect = shutil.which("ect") is not None
     if not quiet and not have_ect:
         print("[warning] ect not found — only XML and ZIP will shrink",
-              file=sys.stderr)
+              file=sys.stderr, flush=True)
     if lossy is not None and not _lossy_tools_ok():
         missing = [m for m, ok in (("Pillow", have_pil()),
                                    ("ffmpeg", have_ffmpeg())) if not ok]
@@ -2294,54 +2380,77 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
             return saved, None, None, False
         return saved, line, None, False
 
-    def _run_all(tmp_root: str) -> list[tuple[int, str | None,
-                                             str | None, bool]]:
-        if file_workers <= 1:
-            return [_one(path, tmp_root) for path in expanded]
+    def _emit(saved: int, outline: str | None,
+            errline: str | None, failed: bool,
+            acc: list) -> None:
+        """Account one finished file and print its line at once. Never raises."""
+        acc[0] += failed
+        acc[1] += saved
+        try:
+            with _PRINT_LOCK:
+                if errline is not None:
+                    print(errline, file=sys.stderr, flush=True)
+                if outline is not None:
+                    print(outline, flush=True)
+        except OSError:
+            pass
+
+    def _run_stream(tmp_root: str, acc: list) -> None:
+        """Run the batch, printing each file line as it finishes."""
+        if file_workers <= 1 or not expanded:
+            for path in expanded:
+                _emit(*_one(path, tmp_root), acc)
+            return
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=file_workers)
         try:
             futs = [ex.submit(_one, path, tmp_root) for path in expanded]
-            return [fut.result() for fut in futs]
+            try:
+                for fut in concurrent.futures.as_completed(futs):
+                    _emit(*fut.result(), acc)
+            except KeyboardInterrupt:
+                for fut in futs:
+                    fut.cancel()
+                ex.shutdown(wait=False)
+                raise
+            else:
+                ex.shutdown(wait=True)
         except KeyboardInterrupt:
-            for fut in futs:
-                fut.cancel()
-            ex.shutdown(wait=False)
+            try:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
             raise
-        else:
-            ex.shutdown(wait=True)
 
+    acc = [0, 0]  # [failures, total_saved]
     try:
         if keep_tmp:
             tmp_root = tempfile.mkdtemp(prefix="fb2opt-")
             if not quiet:
-                print(f"[debug] temp files: {tmp_root}")
-            results = _run_all(tmp_root)
+                with _PRINT_LOCK:
+                    print(f"[debug] temp files: {tmp_root}", flush=True)
+            _run_stream(tmp_root, acc)
         else:
             with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
-                results = _run_all(tmp_root)
+                _run_stream(tmp_root, acc)
     except KeyboardInterrupt:
         _sweep_temps(registry)
-        print("[interrupted]", file=sys.stderr)
+        with _PRINT_LOCK:
+            print("[interrupted]", file=sys.stderr, flush=True)
         return 130
     _sweep_temps(registry)
-    failures = 0
-    total_saved = 0
-    for saved, outline, errline, failed in results:
-        failures += failed
-        total_saved += saved
-        if errline is not None:
-            print(errline, file=sys.stderr)
-        if outline is not None:
-            print(outline)
+    failures, total_saved = acc
     for gone in _find_vanished(before):
-        print(f"[error] {gone}: file disappeared during the run "
-              f"(fb2opt never deletes books — restore it from backup "
-              f"and check other processes)", file=sys.stderr)
+        with _PRINT_LOCK:
+            print(f"[error] {gone}: file disappeared during the run "
+                  f"(fb2opt never deletes books — restore it from backup "
+                  f"and check other processes)", file=sys.stderr, flush=True)
         failures += 1
     if not quiet and len(expanded) > 1:
         file_word = "file" if len(expanded) == 1 else "files"
         byte_word = "byte" if total_saved == 1 else "bytes"
-        print(f"Total: {len(expanded)} {file_word}, saved {total_saved} {byte_word}")
+        with _PRINT_LOCK:
+            print(f"Total: {len(expanded)} {file_word}, saved {total_saved} {byte_word}",
+                  flush=True)
     return 1 if failures else 0
 
 

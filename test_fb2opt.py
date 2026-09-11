@@ -1739,7 +1739,9 @@ class TestAuditDirectCoverage(unittest.TestCase):
 
     def test_deps_helpers(self):
         st = mod.dep_status()
-        self.assertEqual(len(st), 3)
+        self.assertEqual(len(st), 5)
+        self.assertEqual([n for n, _, _ in st],
+                         ["ect", "oxipng", "jpegtran", "Pillow", "ffmpeg"])
         self.assertTrue(all(len(r) == 3 for r in st))
         with mock.patch.object(mod.shutil, "which", return_value=None):
             with mock.patch.object(mod, "have_pil", return_value=False):
@@ -1955,6 +1957,180 @@ class TestAuditDirectCoverage(unittest.TestCase):
                 with self.assertRaises(mod.Fb2OptError):
                     mod.optimize_zip_file(zp, tempfile.mkdtemp(dir=d), False, [])
 
+
+
+class TestVariantChains(unittest.TestCase):
+    """Варианты 1 (oxipng->ect) и 2 (jpegtran-финиш): команды, порядок, фолбэки."""
+
+    def test_have_helpers(self):
+        with mock.patch.object(mod.shutil, "which", return_value="/usr/bin/x"):
+            self.assertTrue(mod.have_oxipng())
+            self.assertTrue(mod.have_jpegtran())
+        with mock.patch.object(mod.shutil, "which", return_value=None):
+            self.assertFalse(mod.have_oxipng())
+            self.assertFalse(mod.have_jpegtran())
+
+    def test_ect_reuse_probe(self):
+        mod._ECT_REUSE_OK = None
+        class R:
+            returncode = 0
+            stdout = b"--reuse  Keep PNG filter"
+        with mock.patch.object(mod.subprocess, "run", return_value=R()):
+            self.assertTrue(mod._ect_reuse_ok())
+            self.assertTrue(mod._ect_reuse_ok())  # cached
+        mod._ECT_REUSE_OK = None
+        class R2:
+            returncode = 0
+            stdout = b"no such flag here"
+        with mock.patch.object(mod.subprocess, "run", return_value=R2()):
+            self.assertFalse(mod._ect_reuse_ok())
+        mod._ECT_REUSE_OK = None
+        with mock.patch.object(mod.subprocess, "run", side_effect=OSError("x")):
+            self.assertFalse(mod._ect_reuse_ok())
+        mod._ECT_REUSE_OK = None
+        with mock.patch.object(mod.subprocess, "run", return_value=R()):
+            self.assertTrue(mod._ect_reuse_ok())
+        mod._ECT_REUSE_OK = None  # leave clean for other tests
+
+    def test_png_chain_order_and_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            _write(p, mod.PNG_MAGIC + b"x" * 100 + mod.PNG_TRAILER, "wb")
+            seen: list = []
+            def fake(cmd):
+                seen.append(cmd)
+                return True
+            with mock.patch.object(mod, "have_oxipng", return_value=True):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod, "run_tool", fake):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual(seen[0][:3], ["oxipng", "-o", "4"])
+            self.assertNotIn("--strip", seen[0])  # chunks (text/ICC) must survive
+            self.assertEqual(seen[1][:3], ["ect", "-9", "--reuse"])
+            # no oxipng, old ect: plain -9, still no -progressive
+            seen.clear()
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=False):
+                    with mock.patch.object(mod, "run_tool", fake):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual(seen, [["ect", "-9", p]])
+            # oxipng failure: ect still runs
+            seen.clear()
+            def flaky(cmd):
+                seen.append(cmd)
+                return False if cmd[0] == "oxipng" else True
+            with mock.patch.object(mod, "have_oxipng", return_value=True):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=False):
+                    with mock.patch.object(mod, "run_tool", flaky):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual([c[0] for c in seen], ["oxipng", "ect"])
+
+    def test_jpg_chain_and_finish_guards(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.jpg")
+            _write(p, mod.JPEG_MAGIC + b"x" * 100 + mod.JPEG_TRAILER, "wb")
+            seen: list = []
+            def fake(cmd):
+                seen.append(cmd)
+                return True
+            with mock.patch.object(mod, "have_jpegtran", return_value=True):
+                with mock.patch.object(mod, "_jpegtran_finish") as jt:
+                    with mock.patch.object(mod, "run_tool", fake):
+                        mod._ect_squeeze(p, "jpg")
+            self.assertIn("-progressive", seen[0])
+            self.assertIn("-strip", seen[0])
+            jt.assert_called_once_with(p)
+            # finish guards: missing file, bad output kept
+            mod._jpegtran_finish(os.path.join(d, "nope.jpg"))
+            mod._jpegtran_finish("")
+            with mock.patch.object(mod, "run_tool", return_value=False):
+                before = open(p, "rb").read()
+                mod._jpegtran_finish(p)
+                self.assertEqual(open(p, "rb").read(), before)
+
+    def test_jpegtran_finish_swaps_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.jpg")
+            orig = mod.JPEG_MAGIC + b"x" * 100 + mod.JPEG_TRAILER
+            _write(p, orig, "wb")
+            smaller = mod.JPEG_MAGIC + b"y" + mod.JPEG_TRAILER
+            def fake(cmd):
+                tmp = cmd[cmd.index("-outfile") + 1]
+                _write(tmp, smaller, "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake):
+                mod._jpegtran_finish(p)
+            self.assertEqual(open(p, "rb").read(), smaller)
+            # broken output: original kept
+            _write(p, orig, "wb")
+            def fake_bad(cmd):
+                tmp = cmd[cmd.index("-outfile") + 1]
+                _write(tmp, b"junk", "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake_bad):
+                mod._jpegtran_finish(p)
+            self.assertEqual(open(p, "rb").read(), orig)
+
+    def test_chains_end_to_end_keep_smaller(self):
+        big_png = mod.PNG_MAGIC + b"x" * 500 + mod.PNG_TRAILER
+        img = mod._Image(idx=0, img_id="c", kind="png", raw=big_png,
+                         orig_b64_len=10, attrs="", orig_body="B")
+        with tempfile.TemporaryDirectory() as d:
+            def fake_shrink(cmd, **kw):
+                shrink_file(cmd[-1])
+                class R: returncode = 0
+                return R()
+            with mock.patch.object(mod, "have_oxipng", return_value=True):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod.subprocess, "run", fake_shrink):
+                        with redirect_stderr(io.StringIO()):
+                            r = mod.optimize_images([img], d, True)
+            self.assertLess(len(r[0]), len(big_png))
+
+
+class TestBatchProgress(unittest.TestCase):
+    """Прогресс виден сразу: строки печатаются по мере готовности, со сбросом."""
+
+    def test_completion_order_not_submission_order(self):
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            slow = os.path.join(d, "slow.fb2.zip")
+            fast = os.path.join(d, "fast.fb2.zip")
+            def fake_one(path, tmp_root, have_ect, registry,
+                         lossy=None, img_workers=1):
+                if path == slow:
+                    _t.sleep(0.5)
+                    return 0, "slow.fb2.zip: already optimal"
+                return 0, "fast.fb2.zip: already optimal"
+            with mock.patch.object(mod, "_optimize_one", fake_one):
+                with mock.patch.object(mod, "_cpu_count", return_value=4):
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        rc = mod._run_optimize_batch([slow, fast], False, False, False)
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("slow.fb2.zip", text)
+            self.assertIn("fast.fb2.zip", text)
+            self.assertLess(text.index("fast.fb2.zip"), text.index("slow.fb2.zip"))
+
+    def test_result_lines_flushed(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "b.fb2.zip")
+            def fake_one(path, tmp_root, have_ect, registry,
+                         lossy=None, img_workers=1):
+                return 0, "b.fb2.zip: already optimal"
+            calls: list = []
+            real_print = print
+            def spy(*a, **k):
+                calls.append((a, k))
+                return real_print(*a, **k)
+            with mock.patch.object(mod, "_optimize_one", fake_one):
+                with mock.patch("builtins.print", spy):
+                    with redirect_stdout(io.StringIO()):
+                        mod._run_optimize_batch([p], False, False, False)
+            outlines = [k for a, k in calls if a and "already optimal" in str(a[0])]
+            self.assertTrue(outlines)
+            self.assertTrue(all(k.get("flush") is True for k in outlines))
 
 
 if __name__ == "__main__":

@@ -188,3 +188,37 @@ Python исключает double-free/use-after-free как класс. Явны
 Замечание: `git diff README.md` (17 строк) — предсуществующее изменение рабочего дерева, не от coder-патча (патч трогал только `fb2opt`, `test_fb2opt.py`); на вердикт не влияет.
 
 *Аудитор: Senior Code Forensics / AppSec QA. Код к релизу готов; roadmap — эскалировано.*
+
+---
+
+# Перепроверка 2026-09-11, раунд 2 — варианты 1 (oxipng→ect) и 2 (jpegtran-финиш)
+
+- Объект: `fb2opt` (+89 строк), `test_fb2opt.py` (+133 строки, новый `TestVariantChains`, 6 методов; правка `test_deps_helpers` 3→5)
+- Прогон: `py_compile OK`, `Ran 132 tests OK` (было 126). Покрытие: 89/89 `def` (4 новые функции покрыты).
+- Спот-чеки: png/jpg фолбэк без oxipng/jpegtran (файлы целы, пути с пробелами ок), `_ect_reuse_ok` кэш, `dep_status` len 5, chain-порядок и фолбэки по мокам — OK.
+- Дифф рабочего дерева: только `fb2opt`, `test_fb2opt.py` (+ untracked `doc/research.md` от исследователя). Запретные `doc/roadmap.md`, `doc/audit.md` (кроме этого отчёта), `.opencode/` не тронуты.
+
+**Вердикт: [APPROVED]**
+
+## §1 Память и ресурсы — принято
+Утечек FD нет (`mkstemp`+`os.close`, `finally: unlink`, контекстные менеджеры). Новых удерживаемых аллокаций нет; `_jpegtran_finish` читает выходной JPEG целиком — на практике ограничен лимитами архива (`MAX_MEMBER_BYTES`), принято.
+
+## §2 Безопасность — принято
+Все вызовы списком без `shell` (`oxipng -o 4 <path>`, `ect -9 [--reuse]`, `jpegtran -optimize -progressive -copy none -outfile tmp path`); пути с пробелами/юникодом безопасны. `-copy none` консистентен с `ect -strip`. `oxipng` без `--strip` — text/ICC чанки выживают (тест assert'ит отсутствие `--strip`), гарантия проекта сохранена. Оригинал через `_jpegtran_finish` не теряется (swap только при `_looks_complete`, иначе `unlink tmp`).
+
+## §3 Сложность — принято
+PNG +1 форк при наличии oxipng (`-o 4`, золотая середина README-примера), JPEG +1 форк при наличии jpegtran; оба гейтятся детектом инструментов. Правило «держать packed-smaller + pixel-identity» ниже по стеку без изменений, регресс невозможен по построению.
+
+## §4 Читаемость — принято
+Гард-клаузы первыми, docstrings объясняют цепочки, `_DEP_CHECKS` динамический, сигнатуры (`_ect_squeeze(path, kind)`) не менялись — новый параметр workdir не вводился сознательно.
+
+## §5 Тесты — закрыто
+`have_*` (present/absent), проба reuse (позитив/негатив/OSError/кэш), порядок PNG-цепочки и отсутствие `--strip`, фолбэк при падении oxipng, JPEG-цепочка + гарды, swap-valid/broken-kept, end-to-end keep-smaller. Существующие тесты progressive-флагов не сломаны (первая команда цепочки — прежняя).
+
+| Блок кода | Тип (Крит/Warning/Opt) | Описание | Как исправить |
+|---|---|---|---|
+| `_jpegtran_finish`: tmp в каталоге книги, не в `tmp_root` | Opt | При SIGKILL останется `.fb2opt-jt-*.jpg` рядом с библиотекой (`_sweep_temps` чистит только реестр) | Принять (окно маленькое, префикс узнаваем); идеально — прокинуть workdir в `_ect_squeeze` (нужен Architect, меняется сигнатура) |
+| `_ECT_REUSE_OK` без лока | Opt | Безвредная гонка (идемпотентный bool под GIL, худшее — двойная проба) | Принять; при желании — `_UMASK_LOCK`-стиль double-checked |
+| `doc/roadmap.md` отсутствует | Warning (владелец: Architect) | Standing issue с прошлого раунда; сверка по `README.md` — расхождений нет | См. предыдущую перепроверку; код не блокируется |
+
+*Аудитор: Senior Code Forensics / AppSec QA.*
