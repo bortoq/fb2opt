@@ -972,9 +972,12 @@ def _ect_squeeze(path: str, kind: str) -> None:
     filters oxipng chose). JPEG: ect, then a jpegtran entropy finish.
     Every stage is optional: missing tools are simply skipped. """
     if kind == "png":
-        if have_oxipng():
-            run_tool(["oxipng", "-o", "4", path])
-        if _ect_reuse_ok():
+        # --reuse keeps the file's filters: only valid when oxipng has
+        # just chosen them (and only when its run actually succeeded).
+        # Without oxipng the file carries the original filters and plain
+        # ect -9 compresses ~2-7x better (external audit P1, reproduced).
+        oxi_ok = run_tool(["oxipng", "-o", "4", path]) if have_oxipng() else False
+        if oxi_ok and _ect_reuse_ok():
             run_tool(["ect", "-9", "--reuse", path])
         else:
             run_tool(["ect", "-9", path])

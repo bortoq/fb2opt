@@ -2031,6 +2031,34 @@ class TestVariantChains(unittest.TestCase):
                         mod._ect_squeeze(p, "png")
             self.assertEqual([c[0] for c in seen], ["oxipng", "ect"])
 
+    def test_reuse_only_after_successful_oxipng(self):
+        # External audit P1: --reuse without oxipng keeps the ORIGINAL
+        # filters and compresses ~2-7x worse. Plain ect -9 then.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            _write(p, mod.PNG_MAGIC + b"x" * 100 + mod.PNG_TRAILER, "wb")
+            seen: list = []
+            def fake(cmd):
+                seen.append(cmd)
+                return True
+            # oxipng absent, ect supports --reuse -> plain -9, no --reuse
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod, "run_tool", fake):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual(seen, [["ect", "-9", p]])
+            # oxipng present but failed -> plain -9, no --reuse
+            seen.clear()
+            def flaky(cmd):
+                seen.append(cmd)
+                return False if cmd[0] == "oxipng" else True
+            with mock.patch.object(mod, "have_oxipng", return_value=True):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod, "run_tool", flaky):
+                        mod._ect_squeeze(p, "png")
+            self.assertEqual([c[0] for c in seen], ["oxipng", "ect"])
+            self.assertNotIn("--reuse", seen[1])
+
     def test_jpg_chain_and_finish_guards(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "a.jpg")
