@@ -1327,7 +1327,9 @@ class TestLossyMarker(unittest.TestCase):
             with mock.patch.object(mod, "_lossy_variant",
                                    return_value=(small_png, (8, 8))):
                 with mock.patch.object(mod, "run_tool", lambda cmd: True):
-                    new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+                    with mock.patch.object(mod, "_lossy_tools_ok",
+                                            return_value=True):
+                        new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
         text = new.decode("utf-8")
         self.assertIn("fb2opt-lossy[0.92:cover]", text)
         self.assertNotIn('fb2opt-lossy="', text)  # tags stay schema-clean
@@ -1363,6 +1365,7 @@ class TestLossyMarker(unittest.TestCase):
 
 
 class TestOutputInvariants(unittest.TestCase):
+    @unittest.skipUnless(HAS_PIL, "Pillow missing")
     def test_no_placeholders_survive(self):
         # Shadowing a uuid placeholder variable once shipped books
         # with __FB2OPT_ markers inside: never again, in any mode.
@@ -1700,7 +1703,10 @@ class TestAuditDirectCoverage(unittest.TestCase):
     def test_run_tool_guards(self):
         self.assertFalse(mod.run_tool([]))
         self.assertFalse(mod.run_tool(["nonexistent-fb2opt-xyz-123"]))
-        self.assertTrue(mod.run_tool(["true"]))
+        class _Ok:
+            returncode = 0
+        with mock.patch.object(mod.subprocess, "run", return_value=_Ok()):
+            self.assertTrue(mod.run_tool(["whatever-cmd"]))
         with mock.patch.object(mod.subprocess, "run", side_effect=OSError("x")):
             self.assertFalse(mod.run_tool(["ect", "f"]))
 
