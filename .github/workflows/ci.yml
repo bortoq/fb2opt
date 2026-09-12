@@ -54,13 +54,22 @@ jobs:
       # paths that hermetic tests always mock.
       - name: install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: cache ect build
+        id: ect-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ect
+          key: ect-0.9.5-${{ runner.os }}
       - name: build ect
+        if: steps.ect-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v0.9.5 \
             https://github.com/fhanau/Efficient-Compression-Tool.git /tmp/ect
           cd /tmp/ect && git submodule update --init --recursive
           cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
+      - name: put ect on PATH
+        run: |
           echo "$(dirname "$(find /tmp/ect/build -name ect -type f | head -1)")" >> "$GITHUB_PATH"
       - name: byte-gate suite (real ect)
         run: python3 test_fb2opt.py

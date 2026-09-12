@@ -79,6 +79,52 @@ JPEG_TRAILER = b"\xff\xd9"
 
 TOOL_TIMEOUT = 600
 
+# Terminal output: dim cyan xml, dim red bin, bright white numbers, bold
+# bright white totals. Colors only on a real tty (never piped, never with
+# NO_COLOR); every painted span is reset, so readers (mc included) cannot
+# be left in a broken state by our output.
+_BRIGHT_CYAN = "\033[96m"
+_BRIGHT_RED = "\033[91m"
+_BRIGHT_WHITE = "\033[97m"
+_BOLD_WHITE = "\033[1;97m"
+# Control chars (incl. ANSI escapes and bidi overrides) in archive-derived
+# names: a crafted image id or file name must never drive the terminal.
+def _use_color() -> bool:
+    """TTY colors allowed right now. Never raises."""
+    try:
+        return bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
+    except Exception:
+        return False
+
+
+def _paint(text: str, code: str) -> str:
+    """Wrap one span in color + reset, or plain when colors are off."""
+    if not text or not code or not _use_color():
+        return text if isinstance(text, str) else ""
+    try:
+        return code + text + "\033[0m"
+    except Exception:
+        return text
+
+
+def _disp(name: object) -> str:
+    """Terminal-safe display form of a file/image name. Never raises."""
+    if not isinstance(name, str) or not name:
+        return ""
+    try:
+        return re.sub(r"[\x00-\x1f\x7f\u200e\u200f\u202a-\u202e"
+                      r"\u2066-\u2069\ufdd0-\ufdef]", "?", name)
+    except Exception:
+        return ""
+
+
+def _sv(saved: int, unit: str = "bytes") -> str:
+    """'saved N bytes' with only the number highlighted. Never raises."""
+    try:
+        return f"saved {_paint(str(saved), _BOLD_WHITE)} {unit}"
+    except Exception:
+        return f"saved {saved} {unit}"
+
 VERSION = "4.7"
 
 # Smart image heuristics (real-world files of unknown origin).
@@ -123,7 +169,6 @@ class Fb2Stats:
     xml_saved: int = 0
     skipped: int = 0  # binary blocks left alone (no id / broken base64)
     dedup_kept: int = 0  # dup blocks kept: refs would dangle, left intact
-    stripped: str = ""  # tech-metadata removed under --lossy (report only)
     marked: int = 0  # images already lossy-stamped, left untouched
     marks: int = 0  # annotation bytes saved (+) or spent (-) on lossy marks
     reopened: int = 0  # stamped images re-opened at a stricter target
@@ -139,20 +184,25 @@ class Fb2Stats:
         self.xml_saved += other.xml_saved
         self.skipped += other.skipped
         self.dedup_kept += other.dedup_kept
-        if other.stripped:
-            self.stripped = (self.stripped + ", " + other.stripped
-                             if self.stripped else other.stripped)
 
-    def breakdown(self) -> str:
-        # Show only types with nonzero savings; zeros carry no information.
+
+    def breakdown(self, color: bool = False) -> str:
+        # Image formats merge into one bin: per-format splits only added
+        # noise to the line. Zeros carry no information.
+        bin_saved = self.png_saved + self.jpg_saved + self.other_saved
+        rows = (("xml", self.xml_saved, _BRIGHT_CYAN),
+                ("bin", bin_saved, _BRIGHT_RED),
+                ("marks", self.marks, ""))
         parts = []
-        for label, value in (("xml", self.xml_saved),
-                             ("png", self.png_saved),
-                             ("jpg", self.jpg_saved),
-                             ("other", self.other_saved),
-                             ("marks", self.marks)):
+        for label, value, code in rows:
             if value:
-                parts.append(f"{label}: {value}")
+                if color and code:
+                    parts.append(f"{code}{label}\033[0m: "
+                                 f"{_BRIGHT_WHITE}{value}\033[0m")
+                elif color:
+                    parts.append(f"{label}: {_BRIGHT_WHITE}{value}\033[0m")
+                else:
+                    parts.append(f"{label}: {value}")
         if not parts:
             parts.append("repack only")
         return ", ".join(parts)
@@ -670,8 +720,8 @@ def _process_image(img: _Image, workdir: str, have_ect: bool,
             if _looks_complete(img.kind, optimized):
                 base = optimized
             else:
-                print(f"[warning] {img.img_id}: optimizer output failed validation, "
-                      f"kept original", file=sys.stderr)
+                print(f"[warning] {_disp(img.img_id)}: optimizer output failed "
+                      f"validation, kept original", file=sys.stderr)
         try:
             os.unlink(tmp)
         except OSError:
@@ -1027,9 +1077,18 @@ SSIM_TIMEOUT = 120
 def _jpegtran_finish(path: str) -> None:
     """Extra lossless entropy pass (mozjpeg/jpegtran). Never raises.
 
-    Runs after ect on a temp copy and moves it back only when valid:
-    the original is never lost through this path. """
+    Keeps the packed-smaller of (ect output, jpegtran output): stock
+    jpegtran scan scripts routinely lose to ect's (measured +6% on real
+    books), so an unconditional move would regress compression. The
+    original is never lost through this path. """
     if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, "rb") as fh:
+            orig = fh.read()
+    except OSError:
+        return
+    if not _looks_complete("jpg", orig):
         return
     try:
         handle, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
@@ -1047,7 +1106,10 @@ def _jpegtran_finish(path: str) -> None:
                 out = fh.read()
         except OSError:
             return
-        if _looks_complete("jpg", out):
+        if not out or not _looks_complete("jpg", out):
+            return
+        # Dual win required (see _beats): packed is a proxy, length is exact.
+        if _beats(orig, out):
             try:
                 os.replace(tmp, path)
             except OSError:
@@ -1068,8 +1130,23 @@ def _is_small_png(path: str) -> bool:
         return False
 
 
+def _beats(best: bytes, cand: bytes) -> bool:
+    """Challenger wins only on both axes: packed proxy AND exact length.
+
+    _packed_cost is a zip proxy and misorders ties/near-ties (measured
+    +195/+478 B regressions on real books); raw length governs the
+    base64 body exactly, so a challenger that loses it is rejected even
+    when the proxy disagrees. Never raises.
+    """
+    try:
+        return (bool(cand) and len(cand) <= len(best)
+                and 0 < _packed_cost(cand) < _packed_cost(best))
+    except Exception:
+        return False
+
+
 def _ect_png_both(path: str) -> None:
-    """Plain -9 and --reuse on pristine bytes, keep packed-smaller.
+    """Plain -9 and --reuse on pristine bytes, keep the dual winner.
 
     --reuse is not always worse (audit: tricky +55B), so on small files
     both passes are milliseconds — try both, keep the winner. Never raises.
@@ -1099,10 +1176,75 @@ def _ect_png_both(path: str) -> None:
     except OSError:
         reuse = b""
     best = orig
-    for cand in (plain, reuse):
-        if (cand and _looks_complete("png", cand)
-                and 0 < _packed_cost(cand) < _packed_cost(best)):
-            best = cand
+    # Plain keeps the legacy strict-packed rule (status quo ante).
+    if (plain and _looks_complete("png", plain)
+            and 0 < _packed_cost(plain) < _packed_cost(best)):
+        best = plain
+    # The challenger must win on both axes (see _beats).
+    if reuse and _looks_complete("png", reuse) and _beats(best, reuse):
+        best = reuse
+    try:
+        with open(path, "wb") as fh:
+            fh.write(best)
+    except OSError:
+        pass
+
+
+def _ect_png_oxi(path: str) -> None:
+    """oxipng reductions + ect --reuse vs plain ect -9, keep packed-min.
+
+    Only for small files (both ect passes are milliseconds there).
+    Falls back to plain ect when oxipng fails or changes nothing.
+    Never raises; the file always ends valid.
+    """
+    try:
+        with open(path, "rb") as fh:
+            orig = fh.read()
+    except OSError:
+        return
+    if not _looks_complete("png", orig):
+        return
+    try:
+        before = len(orig)
+    except TypeError:
+        return
+    if not run_tool(["oxipng", "-o", "4", path]):
+        run_tool(["ect", "-9", path])
+        return
+    try:
+        with open(path, "rb") as fh:
+            oxied = fh.read()
+    except OSError:
+        oxied = b""
+    if not oxied or len(oxied) == before:
+        # Unchanged: plain ect owns this file (P1 regression guard).
+        run_tool(["ect", "-9", path])
+        return
+    run_tool(["ect", "-9", "--reuse", path])
+    try:
+        with open(path, "rb") as fh:
+            combo = fh.read()
+    except OSError:
+        combo = b""
+    try:
+        with open(path, "wb") as fh:
+            fh.write(orig)
+    except OSError:
+        return
+    run_tool(["ect", "-9", path])
+    try:
+        with open(path, "rb") as fh:
+            plain = fh.read()
+    except OSError:
+        plain = b""
+    # Plain keeps the legacy strict-packed rule; the combo challenger
+    # must win on both axes (see _beats).
+    best = orig
+    if (plain and _looks_complete("png", plain)
+            and 0 < _packed_cost(plain) < _packed_cost(best)):
+        best = plain
+    if combo and _looks_complete("png", combo) and _beats(best, combo):
+        best = combo
     try:
         with open(path, "wb") as fh:
             fh.write(best)
@@ -1124,20 +1266,11 @@ def _ect_squeeze(path: str, kind: str) -> None:
         # (audit 4.2: untouched file + --reuse replays the P1 regression).
         # Without oxipng output the original filters stay and plain
         # ect -9 compresses ~2-7x better (external audit P1, reproduced).
-        changed = False
-        if have_oxipng():
-            try:
-                before = os.path.getsize(path)
-            except OSError:
-                before = -1
-            if run_tool(["oxipng", "-o", "4", path]):
-                try:
-                    after = os.path.getsize(path)
-                except OSError:
-                    after = -2
-                changed = before >= 0 and after != before
-        if changed and _ect_reuse_ok():
-            run_tool(["ect", "-9", "--reuse", path])
+        # Small files additionally compare (oxipng+reuse) against plain
+        # ect and keep the packed-smaller: neither chain wins everywhere
+        # (ect alone takes photos, the chain takes graphics).
+        if (have_oxipng() and _ect_reuse_ok() and _is_small_png(path)):
+            _ect_png_oxi(path)
         elif _ect_reuse_ok() and _is_small_png(path):
             _ect_png_both(path)
         else:
@@ -1628,26 +1761,21 @@ def _scan_like(gray, thr: int) -> bool:
     """Bilevel-safe content: no tile dense with near-threshold pixels.
 
     Photos carry gradients that thresholding posterizes into 2 levels
-    while page-level SSIM still passes. Pure PIL, no ffmpeg. Never raises.
+    while page-level SSIM still passes. One C-speed pass: a binary mask
+    of near-threshold pixels averaged down to the tile grid with BOX, so
+    each output pixel IS its tile fraction; the peak decides. Never raises.
     """
-    if gray is None or Image is None:
+    if gray is None or Image is None or ImageStat is None:
         return False
     try:
         w, h = gray.size
         if w <= 0 or h <= 0:
             return False
-        px = gray.load()
-        for ty in range(0, h, BILEVEL_TILE):
-            for tx in range(0, w, BILEVEL_TILE):
-                near = tot = 0
-                for y in range(ty, min(ty + BILEVEL_TILE, h)):
-                    for x in range(tx, min(tx + BILEVEL_TILE, w)):
-                        tot += 1
-                        if abs(px[x, y] - thr) < BILEVEL_TOL:
-                            near += 1
-                if tot and near / tot > BILEVEL_LIMIT:
-                    return False
-        return True
+        tw, th = max(1, w // BILEVEL_TILE), max(1, h // BILEVEL_TILE)
+        mask = gray.point(lambda v: 255 if abs(v - thr) < BILEVEL_TOL else 0)
+        small = mask.resize((tw, th), Image.BOX)
+        peak = ImageStat.Stat(small).extrema[0][1] / 255.0
+        return peak <= BILEVEL_LIMIT
     except Exception:
         return False
 
@@ -2197,11 +2325,9 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
                        if img.idx in mark_set and img.trail is not None
                        and img.trail > lossy)
         stats.reopened += reopened
-        stripped, strip_bytes, strip_notes = _strip_meta_tags(skeleton)
+        stripped, strip_bytes, _strip_notes = _strip_meta_tags(skeleton)
         if strip_bytes:
             skeleton = stripped
-            old_ann += strip_bytes
-            stats.stripped = ", ".join(strip_notes)
     stats.marks = old_ann
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
@@ -2468,18 +2594,11 @@ def _warn_skipped(name: str, stats: Fb2Stats) -> None:
     if stats.dedup_kept:
         print(f"[warning] {name}: kept {stats.dedup_kept} duplicate blocks "
               f"(refs would dangle, left intact)", file=sys.stderr)
-    if stats.stripped:
-        print(f"[info] {name}: stripped tech metadata ({stats.stripped})",
-              file=sys.stderr)
-    if stats.marked:
-        print(f"[info] {name}: {stats.marked} images already lossy-stamped, "
-              f"left untouched (re-run --lossy only bites with a lower target)",
-              file=sys.stderr)
     if stats.reopened:
-        print(f"[info] {name}: {stats.reopened} images re-opened "
+        print(f"[warning] {name}: {stats.reopened} images re-opened "
               f"at a stricter target — quality is measured against "
               f"the already-lossy pixels, not the original",
-              file=sys.stderr)
+              file=sys.stderr, flush=True)
 
 
 def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
@@ -2583,9 +2702,11 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
                                     registry)
     _warn_skipped(name, stats)
     if not replaced:
-        return 0, f"{name}: already optimal"
+        return 0, f"{_disp(name)}: already optimal"
     saved = old_size - os.path.getsize(os.path.abspath(path))
-    return saved, f"{name}: saved {saved} bytes ({stats.breakdown()})"
+    color = _use_color()
+    return saved, (f"{_disp(name)}: {_sv(saved)} "
+                   f"({stats.breakdown(color)})")
 
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
@@ -2632,15 +2753,16 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
         replaced, _ = _place_if_smaller(tmp_path, target, old_size, registry)
         _warn_skipped(name, stats)
         if not replaced:
-            return 0, f"{name}: already optimal"
-        return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
-                                     f"({stats.breakdown()})")
+            return 0, f"{_disp(name)}: already optimal"
+        color = _use_color()
+        return old_size - new_size, (f"{_disp(name)}: {_sv(old_size - new_size)} "
+                                     f"({stats.breakdown(color)})")
 
     old_size = len(payload)
     if new_size >= old_size:
         _drop_tmp(tmp_path, registry)
         _warn_skipped(name, stats)
-        return 0, (f"{name}: saved 0 bytes "
+        return 0, (f"{_disp(name)}: {_sv(0)} "
                    f"(compressed copy is bigger, not created)")
     try:
         os.replace(tmp_path, target)
@@ -2649,8 +2771,10 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
         raise Fb2OptError(f"failed to write {target}: {exc}") from exc
     _reg_forget(registry, tmp_path)
     _warn_skipped(name, stats)
-    return old_size - new_size, (f"{name}: saved {old_size - new_size} bytes "
-                                 f"({stats.breakdown()}) → {os.path.basename(target)}")
+    color = _use_color()
+    return old_size - new_size, (f"{_disp(name)}: {_sv(old_size - new_size)} "
+                                 f"({stats.breakdown(color)}) → "
+                                 f"{_disp(os.path.basename(target))}")
 
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
@@ -2715,8 +2839,7 @@ def _payloads_from_file(path: str):
         except Exception as exc:
             print(f"[error] {path}: {type(exc).__name__}: {exc}", file=sys.stderr)
             return
-        if not members:
-            print(f"[info] {path}: no .fb2 in the archive", file=sys.stderr)
+
         for member_name, data in members:
             yield path, member_name, data
         return
@@ -2763,7 +2886,8 @@ def cmd_extract(sources: list[str], out_dir: str, quiet: bool) -> int:
                 continue
             count += 1
             if not quiet:
-                print(f"  -> {os.path.basename(dest)} (from {book_name})")
+                print(f"  -> {_disp(os.path.basename(dest))} "
+                      f"(from {_disp(book_name)})", flush=True)
     if not quiet:
         print(f"[done] images pulled: {count} → {out_dir}")
     return 0
@@ -2862,8 +2986,8 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
                 return match.group(0)
             updated += 1
             if not quiet:
-                print(f"  [updated] {os.path.basename(found)} "
-                      f"-> id='{id_match.group(1)}'")
+                print(f"  [updated] {_disp(os.path.basename(found))} "
+                      f"-> id='{_disp(id_match.group(1))}'", flush=True)
             return f"<binary{attrs}>{encode_body(data)}</binary>"
 
         ignored = _ignored_spans(text)
@@ -2883,8 +3007,6 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
         _parts.append(text[_last:])
         new_text = "".join(_parts)
         if updated == 0:
-            if not quiet:
-                print(f"[info] {path}: no images to swap in {img_dir}")
             continue
         directory, base = os.path.split(os.path.abspath(path))
         dest = unique_path(os.path.join(directory, f"packed_{base}"))
@@ -3092,8 +3214,8 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
         file_word = "file" if len(expanded) == 1 else "files"
         byte_word = "byte" if total_saved == 1 else "bytes"
         with _PRINT_LOCK:
-            print(f"Total: {len(expanded)} {file_word}, saved {total_saved} {byte_word}",
-                  flush=True)
+            print(f"Total: {len(expanded)} {file_word}, "
+                  f"{_sv(total_saved, byte_word)}", flush=True)
     return 1 if failures else 0
 
 

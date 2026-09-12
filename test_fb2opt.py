@@ -143,7 +143,25 @@ class TestPureHelpers(unittest.TestCase):
         s.xml_saved = 5
         o = mod.Fb2Stats(png_saved=3)
         s.add(o)
-        self.assertEqual(s.breakdown(), "xml: 5, png: 3")
+        self.assertEqual(s.breakdown(), "xml: 5, bin: 3")
+        self.assertNotIn("\033[", s.breakdown())
+        with mock.patch.object(mod.sys.stdout, "isatty", return_value=True):
+            colored = mod.Fb2Stats(xml_saved=5, png_saved=3).breakdown(True)
+        self.assertIn("\033[96mxml\033[0m", colored)
+        self.assertIn("\033[91mbin\033[0m", colored)
+        self.assertIn("\033[97m", colored)
+        self.assertEqual(mod._disp("a\x1bb\r\n"), "a?b??")
+        self.assertEqual(mod._disp(""), "")
+        self.assertEqual(mod._disp(None), "")
+        self.assertEqual(mod._sv(5), "saved 5 bytes")
+        with mock.patch.object(mod.sys.stdout, "isatty", return_value=True):
+            self.assertEqual(mod._sv(5),
+                             "saved " + chr(27) + "[1;97m5" + chr(27)
+                             + "[0m bytes")
+        with mock.patch.dict(mod.os.environ, {"NO_COLOR": "1"}):
+            with mock.patch.object(mod.sys.stdout, "isatty", return_value=True):
+                self.assertEqual(mod._sv(5), "saved 5 bytes")
+                self.assertNotIn("\033[", mod._sv(5))
 
     def test_decode_payload_encodings(self):
         t, enc = mod.decode_fb2_payload("привет".encode())
@@ -1576,7 +1594,7 @@ class TestReopenedAndWrapper(unittest.TestCase):
         # whole program-used element goes (meta-strip), bytes carry the mark
         self.assertNotIn(b"program-used", new)
         self.assertNotIn(b"Tool X", new)
-        self.assertEqual(stats.marks, len(b"<program-used>Tool X</program-used>"))
+        self.assertEqual(stats.marks, 0)  # strip freed bytes count as xml:
         import re as _re6
         m = _re6.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
                         _re6.DOTALL)
@@ -2109,16 +2127,17 @@ class TestVariantChains(unittest.TestCase):
                     with mock.patch.object(mod, "run_tool", fake_plain):
                         mod._ect_squeeze(p, "png")
             self.assertEqual(seen, [["ect", "-9", p]])
-            # oxipng failure: ect still runs
+            # oxipng failure: plain ect still runs
             seen.clear()
             def flaky(cmd):
                 seen.append(cmd)
                 return False if cmd[0] == "oxipng" else True
             with mock.patch.object(mod, "have_oxipng", return_value=True):
-                with mock.patch.object(mod, "_ect_reuse_ok", return_value=False):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
                     with mock.patch.object(mod, "run_tool", flaky):
                         mod._ect_squeeze(p, "png")
             self.assertEqual([c[0] for c in seen], ["oxipng", "ect"])
+            self.assertNotIn("--reuse", seen[1])
 
     def test_reuse_only_after_successful_oxipng(self):
         # External audit P1: --reuse without oxipng keeps the ORIGINAL
@@ -2788,16 +2807,16 @@ class TestMetaStrip(unittest.TestCase):
         fb2 = self._book()
         with tempfile.TemporaryDirectory() as d:
             new, stats = mod.optimize_fb2_payload(fb2, d, False, None)
-        self.assertEqual(stats.stripped, "")
+        self.assertFalse(hasattr(stats, "stripped"))
         self.assertIn(b"publish-info", new)  # default keeps everything
         with tempfile.TemporaryDirectory() as d:
             new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
-        self.assertTrue(stats.stripped)
-        self.assertNotIn(b"publish-info", new)
+        self.assertNotIn(b"publish-info", new)  # stripped bytes live in xml:
+        self.assertGreater(stats.xml_saved, 0)
         err = io.StringIO()
         with redirect_stderr(err):
             mod._warn_skipped("b.fb2.zip", stats)
-        self.assertIn("stripped tech metadata", err.getvalue())
+        self.assertNotIn("[info]", err.getvalue())
 
     def test_rollback_on_surprise(self):
         # Already-invalid books (no required markers to lose) pass through.
@@ -2966,6 +2985,155 @@ class TestNewHelpersDirect(unittest.TestCase):
             imgs, {0: imgs[0].raw}, set(), None, real_attrs, stats)
         self.assertEqual(blocks[0], imgs[0].orig_body)
         self.assertEqual((late, stripped), ([], 0))
+
+
+@unittest.skipUnless(HAVE_ECT, "need real ect")
+class TestCorpusGolden(unittest.TestCase):
+    """Золотая книга: выход никогда не больше эталона (+0.5%).
+
+    Ловит класс «стало больше байт» (jpegtran/v4.9-стиль), который
+    hermetic-тесты не видят. Только в большую сторону: улучшения
+    проходят молча. Опциональные инструменты замокнуты для
+    детерминизма на любом стенде.
+    """
+    GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "testdata", "golden.fb2.zip")
+    TOL = 1.005
+
+    def test_golden_never_regresses(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "testdata", "golden.json")) as fh:
+            import json as _json
+            gold = _json.load(fh)["size"]
+        with tempfile.TemporaryDirectory() as d:
+            work = os.path.join(d, "book.fb2.zip")
+            import shutil as _sh
+            _sh.copy(self.GOLDEN, work)
+            before = os.path.getsize(work)
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "have_jpegtran",
+                                       return_value=False):
+                    with mock.patch.object(mod, "_ect_reuse_ok",
+                                           return_value=False):
+                        saved, line = mod.optimize_zip_file(
+                            work, tempfile.mkdtemp(dir=d), True, [])
+            after = os.path.getsize(work)
+            self.assertLess(after, before)
+            self.assertLessEqual(after, int(gold * self.TOL) + 1)
+
+
+class TestOutputUnits(unittest.TestCase):
+    def test_use_color_paint(self):
+        with mock.patch.object(mod.sys.stdout, "isatty", return_value=False):
+            self.assertFalse(mod._use_color())
+        with mock.patch.object(mod.sys.stdout, "isatty",
+                               side_effect=OSError("closed")):
+            self.assertFalse(mod._use_color())
+        with mock.patch.object(mod, "_use_color", return_value=False):
+            self.assertEqual(mod._paint("x", "CODE"), "x")
+            self.assertEqual(mod._paint("", "CODE"), "")
+        with mock.patch.object(mod, "_use_color", return_value=True):
+            self.assertEqual(mod._paint("x", "CODE"),
+                             "CODE" + "x" + chr(27) + "[0m")
+
+    def test_beats(self):
+        lo = b"a" * 100
+        hi = bytes((i * 7) % 256 for i in range(300))
+        self.assertTrue(mod._beats(hi, lo))
+        self.assertFalse(mod._beats(lo, hi))
+        self.assertFalse(mod._beats(lo, b""))
+        self.assertFalse(mod._beats(b"", lo))
+
+    def test_dual_rule_rejects_proxy_lies(self):
+        # Smaller packed but bigger on disk: challenger loses.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            import random as _rnd
+            orig = (mod.PNG_MAGIC + _rnd.Random(1).randbytes(2000)
+                    + mod.PNG_TRAILER)
+            _write(p, orig, "wb")
+            # fake ect: plain keeps, --reuse returns packed-tiny but long
+            blob = mod.PNG_MAGIC + b"\x00" * 10000 + mod.PNG_TRAILER
+            assert mod._packed_cost(blob) < mod._packed_cost(orig)
+            def fake(cmd):
+                if "--reuse" in cmd:
+                    _write(cmd[-1], blob, "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake):
+                mod._ect_png_both(p)
+            self.assertEqual(open(p, "rb").read(), orig)
+
+    def test_jpegtran_never_replaces_with_worse(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.jpg")
+            orig = mod.JPEG_MAGIC + b"m" * 2000 + mod.JPEG_TRAILER
+            _write(p, orig, "wb")
+            bigger = mod.JPEG_MAGIC + b"n" * 5000 + mod.JPEG_TRAILER
+            def fake(cmd):
+                _write(cmd[cmd.index("-outfile") + 1], bigger, "wb")
+                return True
+            with mock.patch.object(mod, "run_tool", fake):
+                with mock.patch.object(mod, "_packed_cost",
+                                       side_effect=[10, 5, 10, 5]):
+                    mod._jpegtran_finish(p)
+            # packed(out) < packed(orig) but longer on disk: kept
+            self.assertEqual(open(p, "rb").read(), orig)
+
+    def test_ect_png_oxi_units(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.png")
+            _write(p, b"junk", "wb")
+            with mock.patch.object(mod, "run_tool", return_value=True):
+                mod._ect_png_oxi(p)  # invalid input: untouched, no raise
+            self.assertEqual(open(p, "rb").read(), b"junk")
+            raw = mod.PNG_MAGIC + b"v" * 5000 + mod.PNG_TRAILER
+            _write(p, raw, "wb")
+            small = mod.PNG_MAGIC + b"w" * 100 + mod.PNG_TRAILER
+            def fake_oxi_then_ect(cmd):
+                if cmd[0] == "oxipng":
+                    return True  # no rewrite: falls back to plain
+                _write(cmd[-1], small, "wb")
+                return True
+            with mock.patch.object(mod, "have_oxipng", return_value=True):
+                with mock.patch.object(mod, "_ect_reuse_ok", return_value=True):
+                    with mock.patch.object(mod, "run_tool", fake_oxi_then_ect):
+                        mod._ect_png_oxi(p)
+            self.assertEqual(open(p, "rb").read(), small)
+
+
+@unittest.skipUnless(HAVE_ECT, "need real ect")
+class TestCorpusGoldenPhotos(unittest.TestCase):
+    """Золотая книга (только JPEG-фото): выход никогда не больше эталона.
+
+    Ловит класс «цепочка испортила сжатие» (jpegtran/v4.9-стиль).
+    Опциональные инструменты замокнуты: эталон детерминирован PIN-версией
+    ect; улучшения проходят молча (гейт односторонний).
+    """
+    GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "testdata", "golden-photos.fb2.zip")
+    TOL = 1.005
+
+    def test_golden_never_regresses(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "testdata", "golden-photos.json")) as fh:
+            import json as _json
+            gold = _json.load(fh)["size"]
+        with tempfile.TemporaryDirectory() as d:
+            work = os.path.join(d, "book.fb2.zip")
+            import shutil as _sh
+            _sh.copy(self.GOLDEN, work)
+            before = os.path.getsize(work)
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "have_jpegtran",
+                                       return_value=False):
+                    with mock.patch.object(mod, "_ect_reuse_ok",
+                                           return_value=False):
+                        saved, line = mod.optimize_zip_file(
+                            work, tempfile.mkdtemp(dir=d), True, [])
+            after = os.path.getsize(work)
+            self.assertLess(after, before)
+            self.assertLessEqual(after, int(gold * self.TOL) + 1)
+            self.assertIn("bin:", line)
 
 
 if __name__ == "__main__":

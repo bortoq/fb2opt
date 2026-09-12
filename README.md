@@ -1,6 +1,7 @@
 # fb2opt
 
 Optimization of FB2 books packed as `.fb2.zip`. One Python script, no install needed.
+Uses all CPU cores (books and images in parallel) and caches repeated images within a run.
 
 What it does:
 
@@ -27,6 +28,18 @@ a book, `--pack` puts images from a folder back into it.
   XML and ZIP still shrink; with an older `ect` that lacks
   `-progressive`, JPEGs are silently left untouched. Run `fb2opt`
   with no arguments to see what was found.
+- Optional image chain: `oxipng` (PNG reductions before `ect`) and
+  `jpegtran` (extra JPEG entropy pass, best from mozjpeg builds).
+  Both are used only when they produce strictly smaller output.
+- For `--lossy` only: `Pillow` and `ffmpeg`.
+
+| Tool    | Get it | Direct download / install |
+|---------|--------|---------------------------|
+| `ect` 0.9.x | https://github.com/fhanau/Efficient-Compression-Tool | `curl -L -o ect.tar.gz https://github.com/fhanau/Efficient-Compression-Tool/archive/refs/tags/v0.9.5.tar.gz` (then `cmake` + `make`; needs submodules) |
+| `oxipng` | https://github.com/oxipng/oxipng | `cargo install oxipng` (or distro package, e.g. `apt install oxipng`) |
+| `jpegtran` / mozjpeg | https://github.com/mozilla/mozjpeg | stock: `apt install libjpeg-turbo-progs`; mozjpeg: build from the repo above |
+| `Pillow` | https://pypi.org/project/pillow/ | `pip install pillow` |
+| `ffmpeg` | https://ffmpeg.org/download.html | `apt install ffmpeg`, or static builds: https://johnvansickle.com/ffmpeg/ |
 
 ## Install
 
@@ -153,9 +166,16 @@ file itself and guarded by a metric — nothing is taken on faith.
 
 Even the default lossless mode re-encodes when it can prove
 pixel-identity: exact gray → L, palette slack trim, RGB→palette,
-few-color JPEG → PNG, and stray BMP/PPM from sloppy converters → PNG.
+few-color JPEG → PNG, and stray BMP/PPM/TIFF/GIF from sloppy converters
+→ PNG (animation and extra pages always stay as is).
 A format change rewrites the `content-type`
 of the `<binary>` block, so the markup stays honest.
+
+Embedded SVG (XML text in base64) is minified like the FB2 markup
+itself — comments and inter-tag gaps go, tags/attributes/text are
+verified unchanged — and its tags are padded to 3-byte boundaries so
+repeated fragments encode identically in base64 and deflate finds them.
+The format is never converted: SVG stays SVG.
 
 ## Text safety
 
