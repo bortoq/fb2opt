@@ -102,6 +102,13 @@ file itself and guarded by a metric — nothing is taken on faith.
   against the downscaled original, i.e. what the reader would show.
 - **Gray.** Exactly-gray RGB goes L directly; near-gray images get one
   extra L-mode probe at the winning quality (chroma costs bytes).
+- **Meta-strip (documented).** `--lossy` also drops curator-tech
+  metadata: `publish-info`, `src-title-info`, `custom-info`, `output`,
+  `src-url`/`src-ocr`/`history`/`program-used`/`publisher`, extra authors,
+  `keywords`, title `date`, `translator`, author contacts, root
+  `stylesheet`. Required `id`/`version`/`date`, reader-visible fields,
+  `body` and images always stay (XSD-checked, rollback on surprise).
+  Keep a backup: this step is irreversible.
 - **Quality ladders.** Near-gray scans go 1-bit PNG first (Otsu, no dither,
   one full-resolution retry if the metric fails); then JPEG 60→95
   (progressive, source chroma subsampling kept when the source is

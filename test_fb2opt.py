@@ -426,7 +426,7 @@ class TestBatch(unittest.TestCase):
             real_one = mod._optimize_one
 
             def deleting_one(path, tmp_root, have_ect, registry,
-                             lossy=None, img_workers=1):
+                             lossy=None, img_workers=1, *args):
                 if path == zp:
                     os.unlink(path)
                     return 0, "x: already optimal"
@@ -740,7 +740,7 @@ class TestLossyBatchAndCli(unittest.TestCase):
             calls = {"n": 0}
 
             def flaky(path, tmp_root, have_ect, registry, lossy=None,
-                      img_workers=1):
+                      img_workers=1, *args):
                 calls["n"] += 1
                 if "a.fb2" in path:
                     raise RuntimeError("boom")
@@ -1247,40 +1247,31 @@ class TestLossyMarker(unittest.TestCase):
             ' id="a"')
         self.assertEqual(mod._strip_mark_from_attrs(' id="a"'), ' id="a"')
 
-    def test_token_roundtrip(self):
-        marks = {"cover.jpg": 0.92, "pic 1,x;y=z": 0.85}
-        token = mod._render_lossy_token(marks)
-        self.assertTrue(token.startswith("fb2opt-lossy["))
-        back = mod._parse_lossy_token(" converted by X " + token + " done")
-        self.assertEqual(back, marks)
-        self.assertEqual(mod._render_lossy_token({}), "")
+    def test_token_parse_reader(self):
+        # Reader stays for old books; writer is gone (bytes carry marks).
+        back = mod._parse_lossy_token(
+            " converted by X fb2opt-lossy[0.92:cover.jpg;0.85:pic] done")
+        self.assertEqual(back, {"cover.jpg": 0.92, "pic": 0.85})
         self.assertEqual(mod._parse_lossy_token("no token here"), {})
         self.assertEqual(mod._parse_lossy_token("fb2opt-lossy[0.92]"), {})
         self.assertEqual(mod._parse_lossy_token("fb2opt-lossy[xx:a]"), {})
+        self.assertFalse(hasattr(mod, "_render_lossy_token"))
+        self.assertFalse(hasattr(mod, "_write_lossy_token"))
+        self.assertFalse(hasattr(mod, "_upsert_program_used"))
 
-    def test_token_upsert(self):
-        base = ("<description><document-info><author><first-name>A</first-name>"
-                "</author><date>2020-01-01</date><id>1</id><version>1.0</version>"
-                "</document-info></description>")
-        out, ok = mod._upsert_program_used(base, "fb2opt-lossy[0.92:a]")
-        self.assertTrue(ok)
-        self.assertIn("<program-used>fb2opt-lossy[0.92:a]</program-used>", out)
-        self.assertLess(out.index("<program-used>"),
-                        out.index("<date>"))
-        again, ok = mod._upsert_program_used(out, "fb2opt-lossy[0.85:a,b]")
-        self.assertTrue(ok)
-        self.assertEqual(again.count("fb2opt-lossy["), 1)
-        self.assertIn("[0.85:a,b]", again)
-        # existing program-used text survives
-        src2 = base.replace("</author>",
-                            "</author><program-used>Any2Fb2</program-used>", 1)
-        out2, ok = mod._upsert_program_used(src2, "fb2opt-lossy[0.92:a]")
-        self.assertTrue(ok)
-        self.assertIn("Any2Fb2 fb2opt-lossy[0.92:a]", out2)
-        # no document-info at all: honest failure, input untouched
-        same, ok = mod._upsert_program_used("<a>text</a>", "fb2opt-lossy[0.9:x]")
-        self.assertFalse(ok)
-        self.assertEqual(same, "<a>text</a>")
+    def test_token_spans_stripped_from_output(self):
+        # Old tokens never survive a --lossy run; nothing is written back.
+        fb2 = make_fb2()
+        fb2 = fb2.replace(b"<date value=",
+                          b"<program-used>X fb2opt-lossy[0.9:cover]</program-used><date value=",
+                          1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        self.assertNotIn(b"fb2opt-lossy[", new)
+        # meta-strip (same lossy run) takes the whole program-used element
+        self.assertNotIn(b"program-used", new)
+        self.assertGreater(stats.marks, 0)
 
     def test_variant_skips_marked(self):
         if not HAS_PIL:
@@ -1326,8 +1317,14 @@ class TestLossyMarker(unittest.TestCase):
                                             return_value=True):
                         new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
         text = new.decode("utf-8")
-        self.assertIn("fb2opt-lossy[0.92:cover]", text)
+        self.assertNotIn("fb2opt-lossy[", text)  # no token anymore
         self.assertNotIn('fb2opt-lossy="', text)  # tags stay schema-clean
+        import re as _re2
+        m = _re2.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re2.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([92])))  # trail = 0.92
+        self.assertTrue(stored[:-1].startswith(mod.PNG_MAGIC))
         # re-run: marked image is shielded, metric never runs
         def _boom(a, b):
             raise AssertionError("metric must not run on marked")
@@ -1338,7 +1335,7 @@ class TestLossyMarker(unittest.TestCase):
         self.assertEqual(stats2.marked, 1)
         self.assertEqual(new2, new)
 
-    def test_legacy_attr_migrates_to_token(self):
+    def test_legacy_attr_migrates_to_trailing_byte(self):
         if not HAS_PIL:
             self.skipTest("Pillow missing")
         import io as _io
@@ -1353,7 +1350,49 @@ class TestLossyMarker(unittest.TestCase):
                 new, _ = mod.optimize_fb2_payload(fb2, d, False, 0.92)
         text = new.decode("utf-8")
         self.assertNotIn('fb2opt-lossy="', text)  # legacy gone from tags
-        self.assertIn("fb2opt-lossy[0.92:cover]", text)  # lives in token
+        self.assertNotIn("fb2opt-lossy[", text)  # and no token either
+        import re as _re3
+        m = _re3.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re3.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([92])))  # migrated to bytes
+        # shielded on re-run at the same target
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score",
+                                   side_effect=AssertionError("no metric")):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new2, stats2 = mod.optimize_fb2_payload(
+                        new, d, False, 0.92)
+        self.assertEqual(stats2.marked, 1)
+        self.assertEqual(new2, new)
+
+    def test_token_migrates_to_trailing_byte(self):
+        if not HAS_PIL:
+            self.skipTest("Pillow missing")
+        import io as _io
+        buf = _io.BytesIO()
+        _gradient(16, 16).save(buf, "PNG")
+        raw = buf.getvalue()
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        fb2 = fb2.replace(b"<date value=",
+                          b"<program-used>Tool fb2opt-lossy[0.85:cover]</program-used><date value=",
+                          1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                with mock.patch.object(mod, "_lossy_tools_ok",
+                                       return_value=True):
+                    new, stats = mod.optimize_fb2_payload(
+                        fb2, d, False, 0.92)
+        text = new.decode("utf-8")
+        self.assertNotIn("fb2opt-lossy[", text)  # token migrated away
+        # meta-strip (same lossy run) takes the whole program-used element
+        self.assertNotIn(b"program-used", new)
+        self.assertGreater(stats.marks, 0)  # freed annotation bytes
+        import re as _re4
+        m = _re4.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re4.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([85])))  # 0.85 carried over
 
 
 
@@ -1386,7 +1425,7 @@ class TestOutputInvariants(unittest.TestCase):
                 self.assertNotIn(b"__FB2OPT_", new,
                                  f"placeholder leaked (ect={have_ect}, lossy={lossy})")
 
-    def test_fallback_stamps_tags_without_document_info(self):
+    def test_no_document_info_needs_no_fallback(self):
         if not HAS_PIL:
             self.skipTest("Pillow missing")
         import io as _io
@@ -1411,9 +1450,14 @@ class TestOutputInvariants(unittest.TestCase):
                         with redirect_stderr(err):
                             new, _ = mod.optimize_fb2_payload(
                                 fb2, d, False, 0.92)
-        self.assertIn("cannot place lossy token", err.getvalue())
-        self.assertIn(b'fb2opt-lossy="0.92"', new)  # protected, legacy way
+        self.assertNotIn("cannot place lossy token", err.getvalue())
+        self.assertNotIn(b"fb2opt-lossy", new)  # tags AND text clean
         self.assertNotIn(b"__FB2OPT_", new)
+        import re as _re7
+        m = _re7.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re7.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([92])))
 
     def test_binary_tags_stay_schema_clean(self):
         # Audit v8 §4: only id + content-type may sit on <binary>.
@@ -1469,7 +1513,12 @@ class TestReopenedAndWrapper(unittest.TestCase):
                             fb2, d, False, 0.85)
         self.assertEqual(stats.reopened, 1)
         self.assertEqual(stats.marked, 0)
-        self.assertIn(b"fb2opt-lossy[0.85:cover]", new)
+        self.assertNotIn(b"fb2opt-lossy", new)  # bytes carry it now
+        import re as _re8
+        m = _re8.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re8.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([85])))  # new target 0.85
         err = io.StringIO()
         with redirect_stderr(err):
             mod._warn_skipped("b.fb2.zip", stats)
@@ -1497,11 +1546,10 @@ class TestReopenedAndWrapper(unittest.TestCase):
                     with mock.patch.object(mod, "_lossy_tools_ok",
                                            return_value=True):
                         _, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
-        token = mod._render_lossy_token({"cover": 0.92})
-        # make_fb2 has document-info but no program-used: +29 wrapper bytes
-        self.assertEqual(stats.marks, -(len(token) + 29))
+        # byte markers need no wrapper element: nothing is spent
+        self.assertEqual(stats.marks, 0)
 
-    def test_append_costs_one_space(self):
+    def test_program_used_stripped_by_meta_strip(self):
         if not HAS_PIL:
             self.skipTest("Pillow missing")
         import io as _io
@@ -1525,12 +1573,15 @@ class TestReopenedAndWrapper(unittest.TestCase):
                                            return_value=True):
                         new, stats = mod.optimize_fb2_payload(
                             fb2, d, False, 0.92)
-        token = mod._render_lossy_token({"cover": 0.92})
-        self.assertEqual(stats.marks, -(len(token) + 1))
-        self.assertIn(b"Tool X " + token.encode(), new)
-
-
-
+        # whole program-used element goes (meta-strip), bytes carry the mark
+        self.assertNotIn(b"program-used", new)
+        self.assertNotIn(b"Tool X", new)
+        self.assertEqual(stats.marks, len(b"<program-used>Tool X</program-used>"))
+        import re as _re6
+        m = _re6.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new,
+                        _re6.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([92])))
 
 
 class TestSingleLineBodies(unittest.TestCase):
@@ -1624,20 +1675,48 @@ class TestGenericFormats(unittest.TestCase):
         self.assertLessEqual(mod._packed_cost(out), mod._packed_cost(raw))
         self.assertTrue(mod._pixels_equal(out, raw))
 
-    def test_tiff_and_gif_stay(self):
+    def test_tiff_and_gif_rules(self):
         import io as _io
         buf = _io.BytesIO()
         _flat_two_color().save(buf, "TIFF")
         raw = buf.getvalue()
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(
-                mod._try_lossless_variants(self._img(raw, "other"), d,
-                                           raw, False), raw)
+            out = mod._try_lossless_variants(self._img(raw, "other"), d,
+                                             raw, False)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))  # single TIFF crosses
+        self.assertTrue(mod._pixels_equal(out, raw))
+        buf = _io.BytesIO()
+        _flat_two_color().save(buf, "GIF")
+        still = buf.getvalue()
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(still, "gif"), d,
+                                             still, False)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))  # still GIF crosses
+        self.assertTrue(mod._pixels_equal(out, still))
+        buf = _io.BytesIO()
+        _flat_two_color().save(buf, "GIF", save_all=True,
+                               append_images=[_solid("RGB", (64, 64), "red")])
+        anim = buf.getvalue()
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(
-                mod._try_lossless_variants(self._img(b"GIF89a...", "gif"), d,
-                                           b"GIF89a...", True),
-                b"GIF89a...")
+                mod._try_lossless_variants(self._img(anim, "gif"), d,
+                                           anim, True), anim)  # anim stays
+        buf = _io.BytesIO()
+        _flat_two_color().save(buf, "TIFF", save_all=True,
+                               append_images=[_flat_two_color()])
+        multi = buf.getvalue()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(multi, "other"), d,
+                                           multi, False), multi)  # pages stay
+        with tempfile.TemporaryDirectory() as d:
+            crafted = mod._pil_open(raw)
+            crafted.tag_v2[274] = 6  # as real scanner files carry it
+            with mock.patch.object(mod, "_pil_open", return_value=crafted):
+                self.assertEqual(
+                    mod._try_lossless_variants(self._img(raw, "other"), d,
+                                               raw, False),
+                    raw)  # oriented stays
 
 
 
@@ -1819,30 +1898,46 @@ class TestAuditDirectCoverage(unittest.TestCase):
                 png = mod._Image(idx=3, img_id="p", kind="png", raw=PNG_1X1, orig_b64_len=1, attrs="", orig_body="")
                 self.assertEqual(mod._process_image(png, d, False, None, None)[1], PNG_1X1)
 
-    def test_set_token_legacy_project_write(self):
-        self.assertEqual(mod._set_lossy_mark("", 0.92), ' fb2opt-lossy="0.92"')
-        self.assertIn('0.85', mod._set_lossy_mark(' id="a" fb2opt-lossy="0.92"', 0.85))
-        self.assertIn('fb2opt-lossy', mod._set_lossy_mark(' id="a"', 0.9))
-        self.assertGreater(mod._token_bytes("a fb2opt-lossy[0.92:x] b"), 0)
-        self.assertEqual(mod._token_bytes("no token"), 0)
-        self.assertEqual(mod._token_bytes(""), 0)
-        txt = "<binary id='a' fb2opt-lossy=\"0.92\"/><binary id='b'/>"
-        out, n = mod._strip_legacy_marks(txt)
+    def test_trail_and_collect_helpers(self):
+        png = mod.PNG_MAGIC + b"x" * 100 + mod.PNG_TRAILER
+        body, trail = mod._split_trail(png + bytes([92]), "png")
+        self.assertEqual((body, trail), (png, 0.92))
+        self.assertEqual(mod._split_trail(png, "png"), (png, None))
+        self.assertEqual(mod._split_trail(png + b"\x00", "png"), (png + b"\x00", None))
+        jpg = mod.JPEG_MAGIC + b"y" * 100 + mod.JPEG_TRAILER
+        self.assertEqual(mod._split_trail(jpg + bytes([85]), "jpg"),
+                         (jpg, 0.85))
+        self.assertEqual(mod._split_trail(b"GIF89a..", "gif"), (b"GIF89a..", None))
+        self.assertEqual(mod._split_trail(b"", "png"), (b"", None))
+        self.assertEqual(mod._add_trail(png, 0.92), png + bytes([92]))
+        self.assertEqual(mod._add_trail(b"", 0.9), b"")
+        self.assertEqual(mod._add_trail(png, 99.0), png + bytes([100]))
+        known = mod._collect_marks(
+            '<program-used>A fb2opt-lossy[0.9:a;0.85:b]</program-used>'
+            '<binary id="b" fb2opt-lossy="0.8"/>')
+        self.assertEqual(known, {"a": 0.9, "b": 0.8})
+        self.assertEqual(mod._collect_marks("no marks"), {})
+        self.assertTrue(mod._image_refs_ok(
+            '<image href="#a"/><section id="s"/>', {"a"}))
+        self.assertFalse(mod._image_refs_ok('<image href="#gone"/>', {"a"}))
+        self.assertTrue(mod._image_refs_ok("", set()))
+        d1 = mod._digest(b"abc")
+        self.assertEqual(d1, mod._digest(b"abc"))
+        self.assertNotEqual(d1, mod._digest(b"abd"))
+        self.assertEqual(mod._digest(b""), (0, ""))
+        with mock.patch.object(mod.hashlib, "md5",
+                               side_effect=ValueError("FIPS")):
+            d2 = mod._digest(b"abc")
+            self.assertEqual(d2[0], 3)
+            self.assertTrue(d2[1])
+        self.assertEqual(mod._token_bytes("a fb2opt-lossy[0.92:x] b") > 0, True)
+        self.assertEqual(mod._token_bytes("plain"), 0)
+        out, n = mod._strip_legacy_marks(
+            "<binary id='a' fb2opt-lossy=\"0.92\"/>")
         self.assertGreater(n, 0)
         self.assertNotIn("fb2opt-lossy", out)
-        k, present = mod._project_lossy_marks("t", [], None)
-        self.assertEqual((k, present), ({}, set()))
-        # write token: reopened path + fallback path
-        imgs = [mod._Image(idx=0, img_id="cover", kind="png", raw=b"r", orig_b64_len=1, attrs=' id="cover"', orig_body="")]
-        base = ("<description><document-info><author><a/></author>"
-                "<program-used>X</program-used><date>2020</date></document-info></description>"
-                "<binary id=\"cover\">AA==</binary>")
-        known = {"cover": 0.95}
-        skel, old, new, reop = mod._write_lossy_token(base, dict(known), {"cover"}, imgs, {0}, 0.85, {0: ' id="cover"'})
-        self.assertEqual(reop, 1)
-        self.assertIn("fb2opt-lossy[0.85:cover]", skel)
-        skel2, _, _, _ = mod._write_lossy_token("<a/>", {}, set(), [], set(), 0.9, {})
-        self.assertEqual(skel2, "<a/>")
+        self.assertEqual(mod._cache_settings(True, None)[0], True)
+        self.assertEqual(mod._cache_settings(False, 0.9)[0], False)
 
     def test_encode_exact_squeeze_save_drop(self):
         if not HAS_PIL:
@@ -2126,7 +2221,7 @@ class TestBatchProgress(unittest.TestCase):
             slow = os.path.join(d, "slow.fb2.zip")
             fast = os.path.join(d, "fast.fb2.zip")
             def fake_one(path, tmp_root, have_ect, registry,
-                         lossy=None, img_workers=1):
+                         lossy=None, img_workers=1, *args):
                 if path == slow:
                     _t.sleep(0.5)
                     return 0, "slow.fb2.zip: already optimal"
@@ -2146,7 +2241,7 @@ class TestBatchProgress(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "b.fb2.zip")
             def fake_one(path, tmp_root, have_ect, registry,
-                         lossy=None, img_workers=1):
+                         lossy=None, img_workers=1, *args):
                 return 0, "b.fb2.zip: already optimal"
             calls: list = []
             real_print = print
@@ -2438,6 +2533,349 @@ class TestLossyBilevel(unittest.TestCase):
                                 new, _ = mod.optimize_fb2_payload(
                                     fb2, d, False, 0.92)
         self.assertIn(b'content-type="image/png"', new)
+
+
+def _dup_book(b64a, b64b=None, extra_head=""):
+    b64b = b64b if b64b is not None else b64a
+    return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<FictionBook><description><title-info><genre>sf</genre>"
+            "<author><first-name>A</first-name><last-name>B</last-name></author>"
+            "<book-title>T</book-title></title-info>"
+            "<document-info><author><first-name>A</first-name>"
+            "<last-name>B</last-name></author>"
+            "<date value=\"2020-01-01\">2020</date><id>x</id>"
+            "<version>1.0</version></document-info></description>"
+            + extra_head +
+            "<body><section><p><image xlink:href=\"#a\"/>"
+            "<image xlink:href=\"#b\"/></p></section></body>"
+            f"<binary id=\"a\" content-type=\"image/png\">{b64a}</binary>"
+            f"<binary id=\"b\" content-type=\"image/png\">{b64b}</binary>"
+            "</FictionBook>").encode("utf-8")
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestDedup(unittest.TestCase):
+    def test_collapse_and_remap(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        fb2 = _dup_book(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False)
+        self.assertEqual(new.count(b"<binary"), 1)
+        self.assertNotIn(b"#b\"", new)
+        self.assertEqual(stats.pics, 1)
+        import re as _re
+        ids = set(_re.findall(rb'id="([^"]+)"', new))
+        refs = _re.findall(rb'<image\b[^>]*?href="#([^"]+)"', new)
+        self.assertTrue(all(r.decode() in [i.decode() for i in ids]
+                            for r in refs))
+        self.assertEqual(len(fb2) - len(new),
+                         stats.png_saved + stats.jpg_saved +
+                         stats.other_saved + stats.xml_saved)
+
+    def test_no_dups_untouched(self):
+        r1 = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        r2 = _png_bytes(_solid("RGB", (32, 32), (200, 9, 9)))
+        fb2 = _dup_book(base64.b64encode(r1).decode(),
+                        base64.b64encode(r2).decode())
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False)
+        self.assertEqual(new.count(b"<binary"), 2)
+        self.assertEqual(stats.pics, 2)
+
+    def test_no_dedup_flag(self):
+        self.assertFalse(mod.parse_args(["b.fb2.zip"]).no_dedup)
+        self.assertTrue(mod.parse_args(["--no-dedup", "b.fb2.zip"]).no_dedup)
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        fb2 = _dup_book(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            new, _ = mod.optimize_fb2_payload(fb2, d, False,
+                                              dedup=False)
+        self.assertEqual(new.count(b"<binary"), 2)
+
+    def test_rollback_on_dangling(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        fb2 = _dup_book(base64.b64encode(raw).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_image_refs_ok", return_value=False):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    new, stats = mod.optimize_fb2_payload(fb2, d, False)
+        self.assertEqual(new.count(b"<binary"), 2)
+        self.assertGreater(stats.dedup_kept, 0)
+
+    def test_same_id_twice_left_alone(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        b64 = base64.b64encode(raw).decode()
+        fb2 = _dup_book(b64).replace(b'id="b"', b'id="a"')
+        with tempfile.TemporaryDirectory() as d:
+            new, _ = mod.optimize_fb2_payload(fb2, d, False)
+        self.assertEqual(new.count(b"<binary"), 2)
+
+    def test_strictest_mark_wins(self):
+        import random as _rnd
+        raw = (mod.PNG_MAGIC + _rnd.Random(4).randbytes(5000)
+               + mod.PNG_TRAILER)
+        marked92 = raw + bytes([92])
+        marked85 = raw + bytes([85])
+        fb2 = _dup_book(base64.b64encode(marked92).decode(),
+                        base64.b64encode(marked85).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score",
+                                   side_effect=AssertionError("shielded")):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new, stats = mod.optimize_fb2_payload(
+                        fb2, d, False, 0.9)
+        # strictest of the group (0.85) lands on the survivor block
+        import re as _re
+        self.assertEqual(new.count(b"<binary"), 1)
+        m = _re.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new, _re.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([85])))
+        # stable on re-run: same bytes out, still shielded
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score",
+                                   side_effect=AssertionError("shielded")):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    new2, stats2 = mod.optimize_fb2_payload(
+                        new, d, False, 0.9)
+        self.assertEqual(new2, new)
+        self.assertEqual(stats2.marked, 1)
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestSessionCache(unittest.TestCase):
+    def _img(self, raw, idx=0):
+        return mod._Image(idx=idx, img_id=f"i{idx}", kind="png", raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_hit_skips_recompress(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        cache: dict = {}
+        calls = {"n": 0}
+        real = mod._process_image
+
+        def spy(img, workdir, have_ect, lossy, marks):
+            calls["n"] += 1
+            return real(img, workdir, have_ect, lossy, marks)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_process_image", spy):
+                imgs = [self._img(raw, 0), self._img(raw, 1)]
+                r = mod.optimize_images(imgs, d, False, None, None, 1, cache)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(r[0], r[1])
+        self.assertTrue(cache)
+
+    def test_marks_replayed_on_hit(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        cache: dict = {}
+        marks: list = []
+        calls = {"n": 0}
+
+        def winner(img, workdir, have_ect, lossy, mine):
+            calls["n"] += 1
+            mine.append(img.idx)  # like a lossy win does
+            return img.idx, b"win-bytes"
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_process_image", winner):
+                r1 = mod.optimize_images([self._img(raw, 0)], d, True, 0.9,
+                                         marks, 1, cache)
+                r2 = mod.optimize_images([self._img(raw, 5)], d, True, 0.9,
+                                         marks, 1, cache)
+        self.assertEqual(calls["n"], 1)  # second served from cache
+        self.assertEqual(r1[0], b"win-bytes")
+        self.assertEqual(r2[5], b"win-bytes")
+        self.assertEqual(sorted(marks), [0, 5])  # replayed for new idx
+
+    def test_key_separates_contexts(self):
+        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
+        cache: dict = {}
+        calls = {"n": 0}
+        real = mod._process_image
+
+        def spy(img, workdir, have_ect, lossy, marks):
+            calls["n"] += 1
+            return real(img, workdir, have_ect, lossy, marks)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_process_image", spy):
+                mod.optimize_images([self._img(raw, 0)], d, False, None,
+                                    None, 1, cache)
+                mod.optimize_images([self._img(raw, 0)], d, False, 0.9,
+                                    None, 1, cache)
+        self.assertEqual(calls["n"], 2)
+
+    def test_fifo_cap(self):
+        cache: dict = {}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_CACHE_MAX", 2):
+                with mock.patch.object(mod, "_process_image",
+                                       side_effect=lambda i, *a: (i.idx, i.raw)):
+                    for n in range(4):
+                        raw = _png_bytes(
+                            _solid("RGB", (8, 8), (n, n, n)))
+                        mod.optimize_images([self._img(raw, n)], d, False,
+                                            None, None, 1, cache)
+        self.assertLessEqual(len(cache), 2)
+
+
+class TestMetaStrip(unittest.TestCase):
+    def _book(self, desc_extra="", head=""):
+        return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                "<FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\""
+                " xmlns:xlink=\"http://www.w3.org/1999/xlink\">"
+                "<description><title-info><genre>sf</genre>"
+                "<author><first-name>A</first-name><last-name>B</last-name>"
+                "<home-page>http://x</home-page><email>a@x</email></author>"
+                "<book-title>T</book-title><keywords>k1 k2</keywords>"
+                "<date value=\"2001-01-01\">2001</date>"
+                "<coverpage><image xlink:href=\"#c\"/></coverpage>"
+                "<lang>ru</lang><sequence name=\"S\" number=\"1\"/>"
+                "</title-info>"
+                "<document-info><author><nickname>conv</nickname></author>"
+                "<author><nickname>second</nickname></author>"
+                "<program-used>Tool</program-used>"
+                "<date value=\"2020-01-01\">2020</date>"
+                "<src-url>http://src</src-url><src-ocr>ocr</src-ocr>"
+                "<id>test-id</id><version>1.0</version>"
+                "<history><p>v1</p></history>"
+                "<publisher>holder</publisher></document-info>"
+                "<publish-info><publisher>P</publisher><city>C</city>"
+                "<year>1999</year><isbn>123</isbn></publish-info>"
+                "<custom-info info-type=\"x\">y</custom-info>"
+                + desc_extra + "</description>" + head +
+                "<body><section><p>Text</p></section></body>"
+                "</FictionBook>").encode("utf-8")
+
+    def test_blacklist_goes_keeps_stay(self):
+        fb2 = self._book()
+        out, n, notes = mod._strip_meta_tags(fb2.decode("utf-8"))
+        self.assertGreater(n, 0)
+        for gone in ("publish-info", "custom-info", "src-url", "src-ocr",
+                     "history", "program-used", "keywords", "home-page",
+                     "second</nickname>"):
+            self.assertNotIn(gone, out)
+        for keep in ("<genre>sf</genre>", "<book-title>T</book-title>",
+                     "<lang>ru</lang>", "<sequence", "<id>test-id</id>",
+                     "<version>1.0</version>", "2020-01-01", "<body>",
+                     "conv</nickname>"):
+            self.assertIn(keep, out)
+        import xml.etree.ElementTree as _ET
+        _ET.fromstring(out)  # still well-formed
+
+    def test_only_lossy_and_reported(self):
+        fb2 = self._book()
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False, None)
+        self.assertEqual(stats.stripped, "")
+        self.assertIn(b"publish-info", new)  # default keeps everything
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False, 0.92)
+        self.assertTrue(stats.stripped)
+        self.assertNotIn(b"publish-info", new)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            mod._warn_skipped("b.fb2.zip", stats)
+        self.assertIn("stripped tech metadata", err.getvalue())
+
+    def test_rollback_on_surprise(self):
+        # Already-invalid books (no required markers to lose) pass through.
+        fb2 = self._book().replace(b"<id>test-id</id>", b"")
+        out, n, _ = mod._strip_meta_tags(fb2.decode("utf-8"))
+        self.assertNotIn("<publish-info>", out)
+        # Catastrophic over-strip rolls back to the input untouched.
+        full = self._book().decode("utf-8")
+        with mock.patch.object(mod.re, "subn", return_value=("", 5)):
+            out2, n2, notes2 = mod._strip_meta_tags(full)
+        self.assertEqual(out2, full)
+        self.assertEqual((n2, notes2), (0, []))
+
+    def test_body_binary_untouched(self):
+        fb2 = (self._book()
+               .replace(b"</FictionBook>",
+                        b"<binary id=\"c\" content-type=\"image/png\">AAAA</binary>"
+                        b"</FictionBook>"))
+        out, n, _ = mod._strip_meta_tags(fb2.decode("utf-8"))
+        self.assertIn("AAAA", out)
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestClosedLoop(unittest.TestCase):
+    """Маркер никогда не покидает контур книга→RAM→книга."""
+
+    def test_tools_never_see_trail(self):
+        # Closed loop: external tools only ever receive clean bytes.
+        raw = _png_bytes(_solid("RGB", (48, 48), (60, 60, 60)))
+        fb2 = make_fb2(base64.b64encode(raw + bytes([92])).decode())
+        seen: list = []
+
+        def spy_tool(cmd):
+            if cmd[0] in ("ect", "oxipng", "jpegtran"):
+                with open(cmd[-1], "rb") as fh:
+                    seen.append(fh.read())
+            return True
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", spy_tool):
+                with mock.patch.object(mod, "have_oxipng", return_value=True):
+                    with mock.patch.object(mod, "have_jpegtran",
+                                           return_value=True):
+                        mod.optimize_fb2_payload(fb2, d, True, 0.92)
+        self.assertTrue(seen)  # tools actually ran
+        for blob in seen:
+            self.assertFalse(blob.endswith(bytes([92])))
+
+    def test_default_carries_marks(self):
+        raw = _png_bytes(_solid("RGB", (48, 48), (60, 60, 60)))
+        fb2 = make_fb2(base64.b64encode(raw + bytes([90])).decode())
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                new, _ = mod.optimize_fb2_payload(fb2, d, True, None)
+        import re as _re
+        m = _re.search(rb"<binary\b[^>]*>(.*?)</binary\s*>", new, _re.DOTALL)
+        stored = base64.b64decode(b"".join(m.group(1).split()))
+        self.assertTrue(stored.endswith(bytes([90])))
+
+
+class TestCacheDedupUnits(unittest.TestCase):
+    def test_process_cached_direct(self):
+        raw = b"raw-bytes-values"
+        img = mod._Image(idx=3, img_id="c", kind="other", raw=raw,
+                         orig_b64_len=1, attrs="", orig_body="")
+        tools = mod._cache_settings(False, None)
+        cache: dict = {}
+        with mock.patch.object(mod, "_process_image",
+                               return_value=(3, b"out")) as m:
+            self.assertEqual(
+                mod._process_cached(img, "/tmp", False, None, None,
+                                    cache, tools), (3, b"out"))
+            self.assertEqual(
+                mod._process_cached(img, "/tmp", False, None, None,
+                                    cache, tools), (3, b"out"))
+        self.assertEqual(m.call_count, 1)
+        self.assertIn(3, [3])  # idx preserved
+
+    def test_deduplicate_direct(self):
+        import re as _re
+        r1 = b"same-bytes-here"
+        r2 = b"other-bytes-xyz"
+        imgs = [mod._Image(idx=0, img_id="a", kind="other", raw=r1,
+                           orig_b64_len=1, attrs=' id="a"', orig_body="AA"),
+                mod._Image(idx=1, img_id="b", kind="other", raw=r1,
+                           orig_b64_len=1, attrs=' id="b"', orig_body="AA"),
+                mod._Image(idx=2, img_id="c", kind="other", raw=r2,
+                           orig_b64_len=1, attrs=' id="c"', orig_body="BB")]
+        matches = [_re.match("(?s)(.*)", "")] * 3  # placeholder list len
+        # real match objects with group(0): build via finditer on text
+        text = ('<p><image href="#a"/><image href="#b"/></p>'
+                '<binary id="a">AA</binary><binary id="b">AA</binary>'
+                '<binary id="c">BB</binary>')
+        skel = text.replace("AA</binary>", "__P0__</binary>", 1)
+        matches = list(mod.BINARY_RE.finditer(
+            text.replace("__P0__", "AA")))
+        ni, ns, dropped, kept = mod._deduplicate(imgs, matches, skel, "T")
+        self.assertEqual(kept, 0)
+        self.assertEqual([i.img_id for i in ni], ["a", "c"])
+        self.assertNotIn('href="#b"', ns)
+        self.assertGreater(sum(dropped.values()), 0)
 
 
 if __name__ == "__main__":

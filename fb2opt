@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import concurrent.futures
 import io
 import os
@@ -35,7 +36,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass
 
-from urllib.parse import quote, unquote
+from urllib.parse import unquote
 
 try:
     from PIL import Image, ImageChops, ImageStat, PngImagePlugin
@@ -102,6 +103,8 @@ MAX_IMAGE_PX = 50_000_000  # decoded pixels per image (~50 MP)
 _UMASK_LOCK = threading.Lock()
 _CACHED_UMASK: int | None = None
 _REGISTRY_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+_CACHE_MAX = 512  # per-batch entries; FIFO evict beyond
 _PRINT_LOCK = threading.Lock()
 
 
@@ -121,6 +124,8 @@ class Fb2Stats:
     other_saved: int = 0
     xml_saved: int = 0
     skipped: int = 0  # binary blocks left alone (no id / broken base64)
+    dedup_kept: int = 0  # dup blocks kept: refs would dangle, left intact
+    stripped: str = ""  # tech-metadata removed under --lossy (report only)
     marked: int = 0  # images already lossy-stamped, left untouched
     marks: int = 0  # annotation bytes saved (+) or spent (-) on lossy marks
     reopened: int = 0  # stamped images re-opened at a stricter target
@@ -135,6 +140,10 @@ class Fb2Stats:
         self.other_saved += other.other_saved
         self.xml_saved += other.xml_saved
         self.skipped += other.skipped
+        self.dedup_kept += other.dedup_kept
+        if other.stripped:
+            self.stripped = (self.stripped + ", " + other.stripped
+                             if self.stripped else other.stripped)
 
     def breakdown(self) -> str:
         # Show only types with nonzero savings; zeros carry no information.
@@ -160,6 +169,8 @@ class _Image:
     orig_b64_len: int    # base64 body length in the source file (as is)
     attrs: str           # attributes of the <binary ...> tag
     orig_body: str = ""   # original base64 body (for byte-exact keep)
+    trail: float | None = None  # effective lossy mark (byte, token, legacy)
+    rawtrail: float | None = None  # byte marker parsed from stored bytes
 
 
 # --------------------------------------------------------------------------
@@ -246,6 +257,53 @@ def _packed_cost(raw: bytes) -> int:
         return len(zlib.compress(encode_body(raw).encode("ascii"), 9))
     except (TypeError, ValueError, zlib.error):
         return len(raw) if isinstance(raw, bytes) else 0
+
+
+def _digest(raw: bytes) -> tuple[int, str]:
+    """(size, hex) identity for dedup/cache. MD5, sha256 on FIPS blocks."""
+    if not isinstance(raw, bytes) or not raw:
+        return (0, "")
+    try:
+        return (len(raw), hashlib.md5(raw).hexdigest())
+    except Exception:
+        pass
+    try:
+        return (len(raw), hashlib.sha256(raw).hexdigest())
+    except Exception:
+        return (len(raw), "")
+
+
+def _split_trail(raw: bytes, kind: str) -> tuple[bytes, float | None]:
+    """Split a trailing lossy-marker byte. (body, target) or (raw, None).
+
+    Marker counts only after a strict image trailer with a value byte
+    1..100 (= target*100). Natural garbage (or none) is not a marker.
+    """
+    if not raw or len(raw) < 2:
+        return raw, None
+    if kind == "png":
+        ok = raw[:-1].endswith(PNG_TRAILER)
+    elif kind == "jpg":
+        ok = raw[:-1].endswith(JPEG_TRAILER)
+    else:
+        return raw, None
+    if not ok:
+        return raw, None
+    val = raw[-1]
+    if not isinstance(val, int) or not 1 <= val <= 100:
+        return raw, None
+    return raw[:-1], val / 100
+
+
+def _add_trail(body: bytes, target: float) -> bytes:
+    """Append a lossy-marker byte. Empty body comes back untouched."""
+    if not body:
+        return body
+    try:
+        val = max(1, min(100, round(float(target) * 100)))
+    except (TypeError, ValueError, OverflowError):
+        return body
+    return body + bytes([val])
 
 
 def _tag_name(tag: str) -> str:
@@ -480,12 +538,12 @@ def _process_image(img: _Image, workdir: str, have_ect: bool,
     """
     if not img.raw:
         return img.idx, img.raw
-    if img.kind not in ("png", "jpg"):
-        return img.idx, img.raw  # gif/other need no tool, keep as is
+    if img.kind not in ("png", "jpg", "gif", "other"):
+        return img.idx, img.raw  # unknown kinds need no tool, keep as is
     if not have_ect and lossy is None and Image is None:
         return img.idx, img.raw  # no optimizer at all: keep as is
     base = img.raw
-    if have_ect:
+    if have_ect and img.kind in ("png", "jpg"):
         tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
                                     f".{img.kind}")
         try:
@@ -518,10 +576,71 @@ def _process_image(img: _Image, workdir: str, have_ect: bool,
     return img.idx, base
 
 
+def _cache_settings(have_ect: bool, lossy: float | None) -> tuple:
+    """Toolchain fingerprint for the image cache. Never raises."""
+    try:
+        return (bool(have_ect), lossy, have_oxipng(), have_jpegtran(),
+                _ect_reuse_ok())
+    except Exception:
+        return (bool(have_ect), lossy, False, False, False)
+
+
+def _process_cached(img: _Image, workdir: str, have_ect: bool,
+                    lossy: float | None, lossy_marks: list[int] | None,
+                    cache: dict | None, tools: tuple
+                    ) -> tuple[int, bytes]:
+    """_process_image with a per-batch result cache. Thread-safe.
+
+    Key covers bytes and the whole toolchain, so a lossless result can
+    never leak into a lossy context or vice versa. A hit replays the
+    lossy-mark side effect for the current index.
+    """
+    key = None
+    if cache is not None and img.raw:
+        try:
+            key = (_digest(img.raw), img.kind) + tools
+        except Exception:
+            key = None
+    if key is not None:
+        try:
+            with _CACHE_LOCK:
+                hit = cache.get(key)
+        except Exception:
+            hit = None
+        if hit is not None:
+            final, was_marked = hit
+            if was_marked and lossy_marks is not None:
+                try:
+                    with _CACHE_LOCK:
+                        lossy_marks.append(img.idx)
+                except Exception:
+                    pass
+            return img.idx, final
+    mine: list[int] = []
+    idx, final = _process_image(img, workdir, have_ect, lossy, mine)
+    was_marked = idx in mine
+    if lossy_marks is not None and mine:
+        try:
+            with _CACHE_LOCK:
+                lossy_marks.extend(mine)
+        except Exception:
+            pass
+    if key is not None:
+        try:
+            with _CACHE_LOCK:
+                if len(cache) >= _CACHE_MAX:
+                    cache.pop(next(iter(cache)))
+                cache[key] = (final, was_marked)
+        except Exception:
+            pass
+    return idx, final
+
+
 def optimize_images(images: list[_Image], workdir: str,
                     have_ect: bool, lossy: float | None = None,
                     lossy_marks: list[int] | None = None,
-                    workers: int = 1) -> dict[int, bytes]:
+                    workers: int = 1, img_cache: dict | None = None
+                    ) -> dict[int, bytes]:
     """Run images through external optimizers.
 
     Returns {idx: final_bytes}. Each image keeps the smaller of
@@ -529,20 +648,22 @@ def optimize_images(images: list[_Image], workdir: str,
     With lossy (min SSIM 0..1): a metric-gated lossy variant may win,
     but only when strictly smaller than the lossless result.
     workers > 1 spreads images over threads (same bytes out).
+    img_cache (optional per-batch dict) skips repeat compressions.
     """
     result: dict[int, bytes] = {}
     if not images:
         return result
     os.makedirs(workdir, exist_ok=True)
+    tools = _cache_settings(have_ect, lossy)
     if workers <= 1 or len(images) <= 1:
         for img in images:
-            idx, final = _process_image(img, workdir, have_ect, lossy,
-                                        lossy_marks)
+            idx, final = _process_cached(img, workdir, have_ect, lossy,
+                                         lossy_marks, img_cache, tools)
             result[idx] = final
         return result
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(_process_image, img, workdir, have_ect, lossy,
-                          lossy_marks) for img in images]
+        futs = [ex.submit(_process_cached, img, workdir, have_ect, lossy,
+                          lossy_marks, img_cache, tools) for img in images]
         for fut in futs:
             idx, final = fut.result()
             result[idx] = final
@@ -675,20 +796,6 @@ def _strip_mark_from_attrs(attrs: str) -> str:
         return attrs
 
 
-def _set_lossy_mark(attrs: str, target: float) -> str:
-    """Stamp a lossy target on a tag (fallback for books with no place
-    for a token — keeps protection where validity is already broken)."""
-    stamp = f'{LOSSY_MARK}="{target:.4g}"'
-    if not attrs:
-        return " " + stamp
-    try:
-        new_attrs, n = re.subn(LOSSY_MARK + r'\s*=\s*"[0-9.]+"', stamp,
-                               attrs, count=1)
-    except (TypeError, re.error):
-        return attrs
-    return new_attrs if n else f"{attrs} {stamp}"
-
-
 def _parse_lossy_token(text: str) -> dict[str, float]:
     """Read back {img_id: target} from program-used token(s)."""
     out: dict[str, float] = {}
@@ -728,27 +835,6 @@ def _parse_lossy_token(text: str) -> dict[str, float]:
     return out
 
 
-def _render_lossy_token(marks: dict[str, float]) -> str:
-    """Serialize {img_id: target} into one program-used token (stable order)."""
-    if not marks:
-        return ""
-    parts = []
-    try:
-        targets = sorted(set(marks.values()))
-    except Exception:
-        return ""
-    for target in targets:
-        ids = sorted(i for i, t in marks.items() if t == target)
-        try:
-            enc = ",".join(quote(i, safe="") for i in ids)
-            parts.append(f"{target:.4g}:{enc}")
-        except Exception:
-            continue
-    if not parts:
-        return ""
-    return LOSSY_MARK + "[" + ";".join(parts) + "]"
-
-
 def _token_bytes(text: str) -> int:
     """Total bytes of lossy tokens in the text (for annotation accounting)."""
     try:
@@ -781,17 +867,13 @@ def _strip_legacy_marks(text: str) -> tuple[str, int]:
     return out, removed[0]
 
 
-def _project_lossy_marks(text: str, images: list[_Image],
-                         lossy: float | None
-                         ) -> tuple[dict[str, float], set[str]]:
-    """Collect known marks (token + legacy tag attrs) and project them
-    into images, so the variant skip and the shield counter work unchanged.
-    Output tags are rewritten separately from real attrs plus one token.
+def _collect_marks(text: str) -> dict[str, float]:
+    """Known lossy targets from token(s) merged with legacy tag attrs.
+
+    Pure reader for migration: byte markers (already on _Image.trail)
+    take precedence at merge time. Never raises.
     """
     known: dict[str, float] = {}
-    present: set[str] = set()
-    if lossy is None:
-        return known, present
     try:
         known = _parse_lossy_token(text)
         for tag_m in re.finditer(r"<binary\b[^>]*>", text or "",
@@ -800,106 +882,13 @@ def _project_lossy_marks(text: str, images: list[_Image],
             id_m = ID_RE.search(tag)
             if not id_m:
                 continue
-            present.add(id_m.group(1))
             mark = _lossy_mark(tag)
             if mark is not None:
                 prev = known.get(id_m.group(1))
                 known[id_m.group(1)] = mark if prev is None else min(prev, mark)
-        for img in images:
-            if img.img_id in known and LOSSY_MARK + "=" not in (img.attrs or ""):
-                img.attrs = (f'{img.attrs or ""} {LOSSY_MARK}="'
-                             f'{known[img.img_id]:.4g}"')
     except Exception:
-        return {}, present
-    return known, present
-
-
-def _write_lossy_token(skeleton: str, known: dict[str, float],
-                       present_ids: set[str], images: list[_Image],
-                       mark_set: set[int], lossy: float,
-                       real_attrs: dict[int, str]
-                       ) -> tuple[str, int, int, int]:
-    """Merge wins into the token, place it, migrate legacy marks.
-
-    Returns (skeleton, old_ann_bytes, new_ann_bytes, reopened_count).
-    reopened = images already stamped that a stricter target re-opens:
-    their quality is then measured against degraded pixels, not the
-    original — worth one stderr line. Never raises.
-    """
-    reopened = sum(1 for img in images
-                   if img.idx in mark_set and img.img_id in known
-                   and known[img.img_id] > lossy)
-    try:
-        for img in images:
-            if img.idx in mark_set:
-                known[img.img_id] = lossy
-        known = {iid: tgt for iid, tgt in known.items() if iid in present_ids}
-        token = _render_lossy_token(known)
-        if not token:
-            old_ann = _token_bytes(skeleton)
-            try:
-                skeleton = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", skeleton)
-            except Exception:
-                pass
-            return skeleton, old_ann, 0, reopened
-        pre_tok = _token_bytes(skeleton)
-        prog = re.search(r"(<program-used\b[^>]*>)(.*?)(</program-used\s*>)",
-                         skeleton, re.DOTALL | re.IGNORECASE)
-        extra = 0 if prog is None else (1 if prog.group(2).strip() else 0)
-        if prog is None:
-            extra = len("<program-used></program-used>")
-        cand, ok = _upsert_program_used(skeleton, token)
-        if ok:
-            final, legacy_bytes = _strip_legacy_marks(cand)
-            return final, pre_tok + legacy_bytes, len(token) + extra, reopened
-        print("[warning] cannot place lossy token, "
-              "stamping tags instead", file=sys.stderr)
-        for img in images:
-            if img.idx in mark_set:
-                skeleton = _patch_binary_attrs(
-                    skeleton, img.img_id,
-                    _set_lossy_mark(real_attrs[img.idx], lossy))
-        return skeleton, 0, 0, reopened
-    except Exception:
-        return skeleton, 0, 0, 0
-
-
-def _upsert_program_used(text: str, token: str) -> tuple[str, bool]:
-    """Place the token into <program-used> (create it if missing).
-
-    Position respects the schema sequence (after authors, before date).
-    Returns (text, ok); on failure the input comes back untouched.
-    """
-    if not text or not token:
-        return text, False
-    try:
-        cleaned = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", text)
-        prog = re.search(r"(<program-used\b[^>]*>)(.*?)(</program-used\s*>)",
-                         cleaned, re.DOTALL | re.IGNORECASE)
-        if prog:
-            body = prog.group(2).rstrip()
-            body = (body + " " + token) if body else token
-            new = (cleaned[:prog.start()] + prog.group(1) + body
-                   + prog.group(3) + cleaned[prog.end():])
-        else:
-            doc = re.search(r"<document-info\b[^>]*>(.*?)</document-info\s*>",
-                            cleaned, re.DOTALL | re.IGNORECASE)
-            if not doc:
-                return text, False
-            inner = doc.group(1)
-            elem = "<program-used>" + token + "</program-used>"
-            date = re.search(r"<date\b", inner, re.IGNORECASE)
-            if date:
-                new_inner = inner[:date.start()] + elem + inner[date.start():]
-            else:
-                new_inner = inner + elem
-            new = (cleaned[:doc.start(1)] + new_inner
-                   + cleaned[doc.end(1):])
-    except Exception:
-        return text, False
-    if not _parse_lossy_token(new):
-        return text, False
-    return new, True
+        pass
+    return known
 
 
 def _patch_binary_attrs(text: str, img_id: str, new_attrs: str) -> str:
@@ -1103,15 +1092,40 @@ def _exact_crossover_candidates(img: _Image, im
     """Pixel-exact re-encoding into PNG for JPEG and simple formats.
 
     Flat graphics stored as JPEG (or BMP/PPM from sloppy converters)
-    often win as PNG. Skipped with EXIF/ICC aboard: PNG cannot carry
-    them, and EXIF orientation decides how readers show the file —
-    never flip silently. GIF stays out (animation lives frame by frame).
+    often win as PNG; single-frame TIFF and still GIF (unreadable on old
+    readers) cross over too. Skipped with EXIF/ICC aboard: PNG cannot
+    carry them, and EXIF orientation decides how readers show the file —
+    never flip silently. Animation and extra pages always stay as is.
     """
     if img.kind == "jpg":
         pass
-    elif (img.kind not in ("png", "jpg", "gif")
-          and (im.format or "").upper() in GENERIC_SAFE_FORMATS):
-        pass
+    elif img.kind == "gif":
+        try:
+            animated = bool(getattr(im, "is_animated", False))
+            frames = im.n_frames
+        except (AttributeError, TypeError):
+            return []
+        if animated or frames != 1:
+            return []  # animation lives frame by frame
+    elif img.kind == "other":
+        fmt = (im.format or "").upper()
+        if fmt in GENERIC_SAFE_FORMATS:
+            pass
+        elif fmt == "TIFF":
+            try:
+                frames = im.n_frames
+            except (AttributeError, TypeError):
+                frames = 1
+            if frames != 1:
+                return []  # extra pages would be lost
+            try:
+                tag = im.tag_v2.get(274) if hasattr(im, "tag_v2") else None
+            except (AttributeError, TypeError, KeyError):
+                tag = None
+            if tag not in (None, 1):
+                return []  # orientation decides display: never flip silently
+        else:
+            return []
     else:
         return []
     if im.mode not in ("RGB", "L", "P"):
@@ -1182,10 +1196,10 @@ def _try_lossless_variants(img: _Image, workdir: str, base: bytes,
             cands = _exact_png_candidates(img, im)
         elif img.kind == "jpg":
             cands = _exact_crossover_candidates(img, im)
-        elif (im.format or "").upper() in GENERIC_SAFE_FORMATS:
+        elif img.kind == "gif" or (im.format or "").upper() in GENERIC_SAFE_FORMATS | {"TIFF"}:
             cands = _exact_crossover_candidates(img, im)
         else:
-            cands = []  # gif and the truly exotic: keep as is
+            cands = []  # the truly exotic: keep as is
     except Exception:
         return base
     base_cost = _packed_cost(base)
@@ -1572,7 +1586,9 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
     """Metric-gated lossy bytes for one image. None — keep the lossless path."""
     if Image is None or not have_ffmpeg() or not img.raw:
         return None
-    marked = _lossy_mark(img.attrs or "")
+    marked = img.trail
+    if marked is None:
+        marked = _lossy_mark(img.attrs or "")
     if marked is not None and target >= marked:
         return None  # already lossy at this (or gentler) target: never ratchet
     im = _pil_open(img.raw)
@@ -1637,12 +1653,188 @@ def _try_lossy(img: _Image, workdir: str, target: float, base: bytes,
             pass
 
 
+def _image_refs_ok(skeleton: str, ids: set[str]) -> bool:
+    """Every href target resolves: binaries kept or in-text anchors."""
+    if not skeleton:
+        return True
+    try:
+        anchors = set(re.findall(r'\bid\s*=\s*["\']([^"\']+)["\']',
+                                 skeleton or ""))
+        refs = re.findall(r"<(?:image|a)\b[^>]*?\bhref\s*=\s*[\"']#([^\"']+)[\"']",
+                          skeleton, re.IGNORECASE)
+    except re.error:
+        return False
+    targets = set(ids or set()) | anchors
+    return all(r in targets for r in refs)
+
+
+def _deduplicate(images: list[_Image], matches: list,
+                 skeleton: str, token: str
+                 ) -> tuple:
+    """Drop byte-identical binaries, remap image hrefs to survivors.
+
+    Groups by (size, md5) of clean bytes; survivor keeps its block, dup
+    blocks vanish and their hrefs point at the survivor. The surviving
+    mark is the strictest of the group. Returns (images, skeleton,
+    dropped, kept): dropped {kind: bytes} feeds the kind counters, kept
+    counts dup blocks left intact because refs would dangle. Never raises.
+    """
+    try:
+        if not images or len(images) < 2:
+            return images, skeleton, {}, 0
+        groups: dict = {}
+        for img in images:
+            if not img.raw:
+                continue
+            groups.setdefault(_digest(img.raw), []).append(img)
+        dup_groups = [g for g in groups.values() if len(g) > 1]
+        if not dup_groups:
+            return images, skeleton, {}, 0
+        remap: dict[str, str] = {}
+        drop_idx: set[int] = set()
+        dropped: dict[str, int] = {}
+        for group in dup_groups:
+            ordered = sorted(group, key=lambda im: im.idx)
+            surv = ordered[0]
+            try:
+                marks = [im.trail for im in ordered if im.trail is not None]
+                if marks:
+                    surv.trail = min(marks)
+            except (TypeError, ValueError):
+                pass
+            for dup in ordered[1:]:
+                if dup.img_id == surv.img_id:
+                    continue  # same id twice: invalid book, leave alone
+                remap[dup.img_id] = surv.img_id
+                drop_idx.add(dup.idx)
+                dropped[dup.kind] = dropped.get(dup.kind, 0) + len(
+                    matches[dup.idx].group(0))
+        if not remap:
+            return images, skeleton, {}, 0
+        new_skeleton = skeleton
+        for dup_id, surv_id in remap.items():
+            try:
+                pat = re.compile(r"(<image\b[^>]*?\bhref\s*=\s*[\"'])#"
+                                 + re.escape(dup_id) + r"([\"'])",
+                                 re.IGNORECASE)
+            except re.error:
+                return (images, skeleton, {},
+                        sum(len(g) - 1 for g in dup_groups))
+            new_skeleton = pat.sub(r"\1#" + surv_id + r"\2", new_skeleton)
+        for img in images:
+            if img.idx in drop_idx:
+                block = (f"<binary{img.attrs}>__FB2OPT_{token}_{img.idx}__"
+                         f"</binary>")
+                new_skeleton = new_skeleton.replace(block, "", 1)
+        survivors = {img.img_id for img in images if img.idx not in drop_idx}
+        if not _image_refs_ok(new_skeleton, survivors):
+            return images, skeleton, {}, len(drop_idx)
+        new_images = [img for img in images if img.idx not in drop_idx]
+        return new_images, new_skeleton, dropped, 0
+    except Exception:
+        return images, skeleton, {}, 0
+
+
+# Whole optional blocks (all minOccurs=0 per FictionBook.xsd).
+_META_STRIP_BLOCKS = ("publish-info", "src-title-info", "custom-info",
+                      "output", "stylesheet")
+# document-info children safe to drop (id/version/date/author stay).
+_META_STRIP_DOCINFO = ("src-url", "src-ocr", "history", "program-used",
+                       "publisher")
+# title-info children safe to drop (genre/title/annotation/cover/lang stay).
+_META_STRIP_TITLEINFO = ("keywords", "date", "translator")
+
+
+def _strip_meta_tags(text: str) -> tuple[str, int, list[str]]:
+    """Strip curator-tech metadata (lossy squeeze only, documented).
+
+    Blacklist verified against FictionBook.xsd: everything removed is
+    minOccurs=0; required id/version/date, reader-visible fields and the
+    whole body/binary stay. Order-preserving deletion only, so sequence
+    validity cannot break. Validates required markers and rolls back to
+    the input on anything unexpected. Returns (text, bytes, notes).
+    Never raises.
+    """
+    if not text:
+        return text, 0, []
+    try:
+        out = text
+        removed = 0
+        notes: list[str] = []
+
+        def _cut(rx: str, target: str, name: str) -> str:
+            nonlocal removed
+            try:
+                new, n = re.subn(rx, "", target,
+                                 flags=re.DOTALL | re.IGNORECASE)
+            except re.error:
+                return target
+            if n:
+                removed += len(target) - len(new)
+                notes.append(name if n == 1 else f"{name}x{n}")
+            return new
+
+        for name in _META_STRIP_BLOCKS:
+            out = _cut(r"<" + name + r"\b[^>]*>.*?</" + name + r"\s*>",
+                       out, name)
+        m = re.search(r"<document-info\b[^>]*>(.*?)</document-info\s*>",
+                      out, re.DOTALL | re.IGNORECASE)
+        if m:
+            inner = m.group(1)
+            for name in _META_STRIP_DOCINFO:
+                inner = _cut(r"<" + name + r"\b[^>]*>.*?</" + name
+                             + r"\s*>", inner, name)
+            try:
+                authors = list(re.finditer(
+                    r"<author\b[^>]*>.*?</author\s*>", inner,
+                    re.DOTALL | re.IGNORECASE))
+            except re.error:
+                authors = []
+            if len(authors) > 1:  # schema needs >=1: keep the first
+                for am in reversed(authors[1:]):
+                    removed += am.end() - am.start()
+                    inner = inner[:am.start()] + inner[am.end():]
+                notes.append(f"authorx{len(authors) - 1}")
+            out = out[:m.start(1)] + inner + out[m.end(1):]
+
+        def _trim_author(am: re.Match) -> str:
+            tag = am.group(0)
+            return _cut(r"<(?:home-page|email|id)\b[^>]*>"
+                        r".*?</(?:home-page|email|id)\s*>", tag, "author-id")
+
+        def _trim_title(tm: re.Match) -> str:
+            tag = tm.group(0)
+            for tname in _META_STRIP_TITLEINFO:
+                tag = _cut(r"<" + tname + r"\b[^>]*>.*?</" + tname
+                           + r"\s*>", tag, tname)
+            return tag
+
+        try:
+            out = re.sub(r"<author\b[^>]*>.*?</author\s*>", _trim_author,
+                         out, flags=re.DOTALL | re.IGNORECASE)
+            out = re.sub(r"<title-info\b[^>]*>.*?</title-info\s*>",
+                         _trim_title, out, flags=re.DOTALL | re.IGNORECASE)
+        except re.error:
+            pass
+        # Rollback unless every marker present before is still present.
+        for marker in ("<genre", "<book-title", "<lang", "<body", "<id>",
+                       "<version>", "<date"):
+            if marker in text and marker not in out:
+                return text, 0, []
+        if "<binary" in text and "<binary" not in out:
+            return text, 0, []
+        return out, removed, notes
+    except Exception:
+        return text, 0, []
+
+
 # Optimizing one FB2 document (in memory)
 # --------------------------------------------------------------------------
 
 def optimize_fb2_payload(payload: bytes, workdir: str,
                          have_ect: bool, lossy: float | None = None,
-                         img_workers: int = 1
+                         img_workers: int = 1, img_cache: dict | None = None,
+                         dedup: bool = True
                          ) -> tuple[bytes, Fb2Stats]:
     """Optimize the bytes of one .fb2. Returns (new_bytes, stats).
 
@@ -1667,15 +1859,19 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
         if not id_match:
             skipped += 1
             continue  # block without id — leave fully alone
-        raw = decode_body(body)
-        if raw is None:
+        raw_full = decode_body(body)
+        if raw_full is None:
             skipped += 1
             continue  # broken base64 — keep the block as is
         img_id = id_match.group(1)
-        kind = detect_kind(raw, attrs or "")
+        kind = detect_kind(raw_full, attrs or "")
+        # Closed loop: the marker is split off here. Tools below only
+        # ever see clean bytes; it is re-attached at assembly.
+        clean, byte_trail = _split_trail(raw_full, kind)
         images.append(_Image(idx=idx, img_id=img_id, kind=kind,
-                             raw=raw, orig_b64_len=len(body), attrs=attrs,
-                             orig_body=body))
+                             raw=clean, orig_b64_len=len(body), attrs=attrs,
+                             orig_body=body, trail=byte_trail,
+                             rawtrail=byte_trail))
         placeholder = f"__FB2OPT_{token}_{idx}__"
         skeleton_parts.append(text[last:match.start()])
         skeleton_parts.append(f"<binary{attrs}>{placeholder}</binary>")
@@ -1683,35 +1879,65 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
     skeleton_parts.append(text[last:])
     skeleton = "".join(skeleton_parts)
 
-    # Project known marks (program-used token + legacy tag attrs) into
-    # images, so the variant skip and the shield counter work unchanged.
-    # Output tags are rewritten from real attrs plus a single token.
+    # Effective marks: trailing byte wins, then token, then legacy attrs.
+    # Nothing is written back to tags: output carries marks in bytes only.
     real_attrs = {img.idx: img.attrs for img in images}
-    known, present_ids = _project_lossy_marks(text, images, lossy)
+    if lossy is not None:
+        known = _collect_marks(text)
+        for img in images:
+            best = img.trail
+            cand = known.get(img.img_id)
+            if cand is not None:
+                best = cand if best is None else min(best, cand)
+            leg = _lossy_mark(img.attrs or "")
+            if leg is not None:
+                best = leg if best is None else min(best, leg)
+            img.trail = best
+
+    dedup_dropped: dict[str, int] = {}
+    dedup_kept = 0
+    if dedup:
+        (images, skeleton, dedup_dropped,
+         dedup_kept) = _deduplicate(images, matches, skeleton, token)
 
     lossy_marks: list[int] = []
     optimized = optimize_images(images, workdir, have_ect, lossy,
-                                lossy_marks, img_workers)
+                                lossy_marks, img_workers, img_cache)
 
     stats = Fb2Stats(pics=len(images), skipped=skipped)
+    stats.dedup_kept = dedup_kept
+    for kind, saved in (dedup_dropped or {}).items():
+        if not saved:
+            continue
+        if kind == "png":
+            stats.png_saved += saved
+        elif kind == "jpg":
+            stats.jpg_saved += saved
+        else:
+            stats.other_saved += saved
+
     blocks: dict[int, str] = {}
     skeleton_late: list[tuple[str, str]] = []  # (img_id, final_attrs)
     mark_set = set(lossy_marks)
     kind_stripped = 0
     for img in images:
         final = optimized.get(img.idx, img.raw)
-        if final == img.raw:
-            # The skeleton already holds the tags around the placeholder: swap the body only.
-            # Original body = byte-exact same block, delta 0.
+        # Closed loop: the marker never reaches tools; re-attach at assembly.
+        stored_trail = (lossy if (lossy is not None and img.idx in mark_set)
+                        else img.trail)
+        if final == img.raw and stored_trail == img.rawtrail:
+            # Byte-exact keep (marker intact inside orig_body), delta 0.
             blocks[img.idx] = img.orig_body
-            if lossy is not None:
-                marked = _lossy_mark(img.attrs or "")
-                if marked is not None and lossy >= marked:
-                    stats.marked += 1
+            if (lossy is not None and img.trail is not None
+                    and lossy >= img.trail):
+                stats.marked += 1
             continue
+        stored = (final if stored_trail is None
+                  else _add_trail(final, stored_trail))
         # Single-line bodies everywhere; the counter compares against the
-        # flattened original, so wrapping style never leaks into numbers.
-        new_body = encode_body(final)
+        # flattened original (trailing byte included), so wrapping style
+        # never leaks into numbers.
+        new_body = encode_body(stored)
         blocks[img.idx] = new_body
         final_kind = detect_kind(final, "")
         raw_attrs = real_attrs[img.idx]
@@ -1724,7 +1950,9 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
             attrs = _set_content_type(attrs, final_kind)
         if attrs != raw_attrs:
             skeleton_late.append((img.img_id, attrs))
-        delta = _flat_b64_len(img.raw) - len(new_body)
+        orig_full = (img.raw if img.rawtrail is None
+                     else _add_trail(img.raw, img.rawtrail))
+        delta = _flat_b64_len(orig_full) - len(new_body)
         if img.kind == "png":
             stats.png_saved += delta
         elif img.kind == "jpg":
@@ -1734,14 +1962,27 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     for img_id, attrs in skeleton_late:
         skeleton = _patch_binary_attrs(skeleton, img_id, attrs)
-    old_ann = new_ann = 0
+    # Migration: old token spans and legacy tag marks leave the markup;
+    # the bytes carry the marks now, so freed bytes count as annotation.
+    old_ann = kind_stripped
     if lossy is not None:
-        skeleton, old_ann, new_ann, reopened = _write_lossy_token(
-            skeleton, known, present_ids, images, mark_set, lossy,
-            real_attrs)
+        old_ann += _token_bytes(skeleton)
+        try:
+            skeleton = re.sub(LOSSY_MARK + r"\[[^\]]*\]", "", skeleton)
+        except Exception:
+            pass
+        skeleton, legacy_bytes = _strip_legacy_marks(skeleton)
+        old_ann += legacy_bytes
+        reopened = sum(1 for img in images
+                       if img.idx in mark_set and img.trail is not None
+                       and img.trail > lossy)
         stats.reopened += reopened
-        old_ann += kind_stripped
-    stats.marks = old_ann - new_ann
+        stripped, strip_bytes, strip_notes = _strip_meta_tags(skeleton)
+        if strip_bytes:
+            skeleton = stripped
+            old_ann += strip_bytes
+            stats.stripped = ", ".join(strip_notes)
+    stats.marks = old_ann
     new_skeleton = minify_skeleton(skeleton)
     for img in images:
         new_skeleton = new_skeleton.replace(f"__FB2OPT_{token}_{img.idx}__",
@@ -2004,7 +2245,13 @@ def _warn_skipped(name: str, stats: Fb2Stats) -> None:
     if stats.skipped:
         print(f"[warning] {name}: skipped {stats.skipped} bad <binary> blocks "
               f"(no id or broken base64)", file=sys.stderr)
-    if stats.marked:
+    if stats.dedup_kept:
+        print(f"[warning] {name}: kept {stats.dedup_kept} duplicate blocks "
+              f"(refs would dangle, left intact)", file=sys.stderr)
+    if stats.stripped:
+        print(f"[info] {name}: stripped tech metadata ({stats.stripped})",
+              file=sys.stderr)
+
         print(f"[info] {name}: {stats.marked} images already lossy-stamped, "
               f"left untouched (re-run --lossy only bites with a lower target)",
               file=sys.stderr)
@@ -2052,7 +2299,8 @@ def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
 
 def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
                        registry: list[str], lossy: float | None = None,
-                       img_workers: int = 1
+                       img_workers: int = 1, img_cache: dict | None = None,
+                       dedup: bool = True
                        ) -> tuple[int, str]:
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
@@ -2096,7 +2344,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
         if info.filename.lower().endswith(".fb2"):
             try:
                 new_data, member_stats = optimize_fb2_payload(
-                    data, img_workdir, have_ect, lossy, img_workers)
+                    data, img_workdir, have_ect, lossy, img_workers,
+                    img_cache, dedup)
             except Fb2OptError as exc:
                 raise Fb2OptError(f"{info.filename}: {exc}") from exc
             stats.add(member_stats)
@@ -2122,7 +2371,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
                        registry: list[str], lossy: float | None = None,
-                       img_workers: int = 1
+                       img_workers: int = 1, img_cache: dict | None = None,
+                       dedup: bool = True
                        ) -> tuple[int, str]:
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
@@ -2137,7 +2387,8 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
     img_workdir = os.path.join(tmp_root, "img")
     new_payload, stats = optimize_fb2_payload(payload, img_workdir, have_ect,
-                                               lossy, img_workers)
+                                               lossy, img_workers,
+                                               img_cache, dedup)
 
     target = abs_path + ".zip"
     entries = [(_fresh_info(os.path.basename(abs_path), abs_path), new_payload)]
@@ -2186,7 +2437,8 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
                    registry: list[str], lossy: float | None = None,
-                   img_workers: int = 1
+                   img_workers: int = 1, img_cache: dict | None = None,
+                   dedup: bool = True
                    ) -> tuple[int, str]:
     """Optimize a single file; errors come as Fb2OptError."""
     if not isinstance(path, str) or not path:
@@ -2199,10 +2451,10 @@ def _optimize_one(path: str, tmp_root: str, have_ect: bool,
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
         return optimize_zip_file(path, per_file_tmp, have_ect, registry,
-                                 lossy, img_workers)
+                                 lossy, img_workers, img_cache, dedup)
     if lowered.endswith(".fb2"):
         return optimize_fb2_file(path, per_file_tmp, have_ect, registry,
-                                 lossy, img_workers)
+                                 lossy, img_workers, img_cache, dedup)
     raise Fb2OptError("need .fb2 or .zip")
 
 
@@ -2462,6 +2714,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                              f"(default {LOSSY_DEFAULT_SSIM})")
     parser.add_argument("--keep-tmp", action="store_true",
                         help="keep temp files (debugging)")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="keep duplicate images (skip dedup)")
     return parser.parse_args(argv)
 
 
@@ -2488,7 +2742,8 @@ def main(argv: list[str] | None = None) -> int:
         print(short_hint())
         return 2
     return _run_optimize_batch(args.files, args.quiet, args.keep_tmp,
-                                 args.recursive, lossy)
+                                 args.recursive, lossy,
+                                 not args.no_dedup)
 
 
 def _expand_sources(files: list[str], recursive: bool) -> list[str]:
@@ -2511,7 +2766,8 @@ def _expand_sources(files: list[str], recursive: bool) -> list[str]:
 
 
 def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
-                        recursive: bool, lossy: float | None = None
+                        recursive: bool, lossy: float | None = None,
+                        dedup: bool = True
                         ) -> int:
     """Optimize a file list without falling on the first broken one."""
     have_ect = shutil.which("ect") is not None
@@ -2526,6 +2782,7 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
         return 2
     expanded = _expand_sources(files, recursive)
     registry: list[str] = []
+    img_cache: dict = {}  # per-session image cache: identical bytes, one squeeze
     # Census: fb2opt only ever replaces files in place, never deletes them.
     # If an input is gone when the batch is done, say so loudly.
     before = {path: os.path.lexists(path) for path in expanded
@@ -2541,7 +2798,8 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
         """Optimize one file. Returns (saved, stdout, stderr, failed)."""
         try:
             saved, line = _optimize_one(path, tmp_root, have_ect, registry,
-                                        lossy, img_workers)
+                                        lossy, img_workers, img_cache,
+                                        dedup)
         except Fb2OptError as exc:
             return 0, None, f"[error] {path}: {exc}", True
         except Exception as exc:
