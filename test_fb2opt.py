@@ -2509,6 +2509,26 @@ class TestLossyBilevel(unittest.TestCase):
                 self.assertIsNone(
                     mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.92))
 
+    def test_photo_inlay_rejected_without_metric(self):
+        # Prefilter (pure PIL) rejects photo inlays before any SSIM call,
+        # so Posterization can never hide behind a page-level mean.
+        import random as _rnd
+        rng = _rnd.Random(9)
+        ph = _scan_rgb(56, 42)
+        px = ph.load()
+        for x in range(56):
+            for y in range(42):
+                px[x, y] = (rng.randrange(256), rng.randrange(256),
+                            rng.randrange(256))
+        page = _scan_rgb(300, 300)
+        page.paste(ph, (100, 120))
+        img = self._img(b"x" * 5000, "jpg")
+        def _boom(a, b):
+            raise AssertionError("metric must not run on photo inlays")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                self.assertIsNone(mod._lossy_bilevel(page, img, d, 0.92))
+
     def test_guards_skip_before_metric(self):
         from PIL import Image as _I
         import io as _io
@@ -2771,6 +2791,8 @@ class TestMetaStrip(unittest.TestCase):
                 "<date value=\"2001-01-01\">2001</date>"
                 "<coverpage><image xlink:href=\"#c\"/></coverpage>"
                 "<lang>ru</lang><sequence name=\"S\" number=\"1\"/>"
+                "<translator><first-name>Tr</first-name>"
+                "<last-name>Ansl</last-name></translator>"
                 "</title-info>"
                 "<document-info><author><nickname>conv</nickname></author>"
                 "<author><nickname>second</nickname></author>"
@@ -2796,6 +2818,7 @@ class TestMetaStrip(unittest.TestCase):
                      "second</nickname>"):
             self.assertNotIn(gone, out)
         for keep in ("<genre>sf</genre>", "<book-title>T</book-title>",
+                     "<translator>", "<first-name>Tr</first-name>",
                      "<lang>ru</lang>", "<sequence", "<id>test-id</id>",
                      "<version>1.0</version>", "2020-01-01", "<body>",
                      "conv</nickname>"):
@@ -2926,11 +2949,13 @@ class TestRealMetric(unittest.TestCase):
     """Единственный тест с настоящей метрикой (живёт в byte-gate job)."""
 
     def test_bilevel_real_ssim(self):
+        # Real ffmpeg metric at the default target (measured 1.0 locally;
+        # 0.92 leaves a chasm of margin).
         raw = _jpeg_bytes(_scan_rgb(300, 300), 95)
         img = mod._Image(idx=0, img_id="s", kind="jpg", raw=raw,
                          orig_b64_len=10, attrs="", orig_body="")
         with tempfile.TemporaryDirectory() as d:
-            hit = mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.5)
+            hit = mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.92)
         self.assertIsNotNone(hit)
         self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
         self.assertEqual(mod._pil_open(hit[0]).mode, "1")
@@ -2991,10 +3016,9 @@ class TestNewHelpersDirect(unittest.TestCase):
 class TestCorpusGolden(unittest.TestCase):
     """Золотая книга: выход никогда не больше эталона (+0.5%).
 
-    Ловит класс «стало больше байт» (jpegtran/v4.9-стиль), который
-    hermetic-тесты не видят. Только в большую сторону: улучшения
-    проходят молча. Опциональные инструменты замокнуты для
-    детерминизма на любом стенде.
+    Покрывает базовую цепочку при замокнутых опциональных инструментах
+    (детерминизм на любом стенде с PIN-версией ect). Гейт односторонний:
+    улучшения проходят молча.
     """
     GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "testdata", "golden.fb2.zip")
@@ -3101,13 +3125,18 @@ class TestOutputUnits(unittest.TestCase):
             self.assertEqual(open(p, "rb").read(), small)
 
 
+HAVE_JT = __import__("shutil").which("jpegtran") is not None
+
+
 @unittest.skipUnless(HAVE_ECT, "need real ect")
 class TestCorpusGoldenPhotos(unittest.TestCase):
     """Золотая книга (только JPEG-фото): выход никогда не больше эталона.
 
-    Ловит класс «цепочка испортила сжатие» (jpegtran/v4.9-стиль).
-    Опциональные инструменты замокнуты: эталон детерминирован PIN-версией
-    ect; улучшения проходят молча (гейт односторонний).
+    Покрывает базовую цепочку (ect, переупаковка, минификация) при
+    замокнутых опциональных инструментах; правила цепочек
+    (jpegtran/oxipng/--reuse) проверяют юнит-тесты с фейковыми
+    инструментами, а jpegtran-путь — TestCorpusGoldenJpegtran ниже.
+    Гейт односторонний: улучшения проходят молча.
     """
     GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "testdata", "golden-photos.fb2.zip")
@@ -3175,6 +3204,81 @@ class TestEctFailure(unittest.TestCase):
             with mock.patch.object(mod.subprocess, "run", boom):
                 r = mod.optimize_images([img], d, True)
         self.assertEqual(r[0], raw)
+
+
+@unittest.skipUnless(HAVE_ECT and HAVE_JT, "need real ect + jpegtran")
+class TestCorpusGoldenJpegtran(unittest.TestCase):
+    """Тот же фикстур, но jpegtran включён по-настоящему.
+
+    Ловит регрессии keep-min финиша (безусловная замена давала +6%):
+    эталон снят с включённым jpegtran, oxipng/--reuse замокнуты.
+    """
+    GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "testdata", "golden-photos.fb2.zip")
+    TOL = 1.005
+
+    def test_golden_never_regresses(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "testdata", "golden-jt.json")) as fh:
+            import json as _json
+            gold = _json.load(fh)["size"]
+        with tempfile.TemporaryDirectory() as d:
+            work = os.path.join(d, "book.fb2.zip")
+            import shutil as _sh
+            _sh.copy(self.GOLDEN, work)
+            before = os.path.getsize(work)
+            with mock.patch.object(mod, "have_oxipng", return_value=False):
+                with mock.patch.object(mod, "_ect_reuse_ok",
+                                       return_value=False):
+                    saved, line = mod.optimize_zip_file(
+                        work, tempfile.mkdtemp(dir=d), True, [])
+            after = os.path.getsize(work)
+            self.assertLess(after, before)
+            self.assertLessEqual(after, int(gold * self.TOL) + 1)
+
+
+class TestSplitHelpers(unittest.TestCase):
+    def test_group_and_resolve(self):
+        a = mod._Image(idx=0, img_id="a", kind="png", raw=b"11",
+                       orig_b64_len=1, attrs="", orig_body="", trail=0.9)
+        b = mod._Image(idx=1, img_id="b", kind="png", raw=b"11",
+                       orig_b64_len=1, attrs="", orig_body="", trail=0.85)
+        c = mod._Image(idx=2, img_id="c", kind="png", raw=b"22",
+                       orig_b64_len=1, attrs="", orig_body="")
+        groups = mod._group_dup_finals([a, b, c], {0: b"11", 1: b"11", 2: b"22"})
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(mod._group_dup_finals([], {}), [])
+        marks: set = set()
+        surv, dups, hit = mod._resolve_dup_group(groups[0], marks, 0.92)
+        self.assertEqual((surv.img_id, [d.img_id for d in dups], hit),
+                         ("a", ["b"], 0))
+        self.assertAlmostEqual(surv.trail, 0.85)  # strictest wins
+        marks2 = {1}
+        surv2, _, hit2 = mod._resolve_dup_group(groups[0], marks2, 0.8)
+        self.assertEqual(hit2, 1)  # carried 0.85 > 0.8: re-opened
+        self.assertIn(0, marks2)
+
+    def test_excise(self):
+        skel = ('<p><image href="#b"/></p>'
+                '<binary id="a">AA</binary><binary id="b">AA</binary>')
+        out = mod._excise_dup_blocks([], set(), {}, skel, "T")
+        self.assertEqual(out, skel)
+        imgs = [mod._Image(idx=0, img_id="a", kind="png", raw=b"1",
+                           orig_b64_len=1, attrs=' id="a"', orig_body="")]
+        out = mod._excise_dup_blocks(imgs, {1}, {"b": "a"}, skel, "T")
+        self.assertIsNotNone(out)
+        self.assertNotIn('href="#b"', out)
+
+    @unittest.skipUnless(HAS_PIL and mod.have_ffmpeg(), "need Pillow + ffmpeg")
+    def test_bilevel_attempt_units(self):
+        from PIL import Image as _I
+        with tempfile.TemporaryDirectory() as d:
+            src = _I.new("RGB", (64, 64), "white")
+            hit = mod._bilevel_attempt(src, (64, 64),
+                                       os.path.join(d, "s"), 0, [], 0.9, src)
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit[1], (64, 64))
+            self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
 
 
 if __name__ == "__main__":

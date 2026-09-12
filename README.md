@@ -121,7 +121,8 @@ file itself and guarded by a metric — nothing is taken on faith.
 - **Meta-strip (documented).** `--lossy` also drops curator-tech
   metadata: `publish-info`, `src-title-info`, `custom-info`, `output`,
   `src-url`/`src-ocr`/`history`/`program-used`/`publisher`, extra authors,
-  `keywords`, title `date`, `translator`, author contacts, root
+  `keywords`, title `date`, author contacts (translator kept),
+  root
   `stylesheet`. Required `id`/`version`/`date`, reader-visible fields,
   `body` and images always stay (XSD-checked, rollback on surprise).
   Keep a backup: this step is irreversible.

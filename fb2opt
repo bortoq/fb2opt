@@ -1835,46 +1835,53 @@ def _lossy_bilevel(im, img: _Image, workdir: str, target: float
     tmps: list[str] = []
     try:
         for n, size in enumerate(sizes):
-            try:
-                base = (src if tuple(src.size) == tuple(size)
-                        else src.resize(size, Image.LANCZOS))
-                gray = base.convert("L")
-                # Per-size gate: downscaling blurs thin strokes into gray
-                # smears, so the work size may fail while full size passes
-                # (and vice versa never buys anything for photos: gradients
-                # persist across scales). Failed sizes are skipped outright.
-                if not _scan_like(gray, 128):
-                    continue  # thresholding would posterize gradients
-                    # while page SSIM still passes; ladders handle those
-                thr = _otsu_threshold(gray.histogram(), size[0] * size[1])
-                bilev = gray.point(lambda v, t=thr: 255 if v > t else 0,
-                                   mode="1")
-                buf = io.BytesIO()
-                _save_png(bilev, buf, meta_from=im)
-                cand = buf.getvalue()
-            except Exception:  # Pillow zoo on hostile inputs, next size
-                continue
-            if not cand.startswith(PNG_MAGIC):
-                continue
-            try:
-                ref_path = stem + f"_r{n}.png"
-                ref_img = (src if tuple(src.size) == tuple(size)
-                           else src.resize(size, Image.LANCZOS))
-                ref_img.save(ref_path)
-                tmps.append(ref_path)
-                cand_path = stem + f"_c{n}.png"
-                bilev.convert("RGB").save(cand_path)
-                tmps.append(cand_path)
-            except (OSError, ValueError):
-                continue
-            if tuple(bilev.size) != tuple(size):
-                continue
-            score = _ssim_score(ref_path, cand_path)
-            if score is not None and score >= target:
-                return cand, tuple(size)
+            hit = _bilevel_attempt(src, size, stem, n, tmps, target, im)
+            if hit is not None:
+                return hit
         return None
     finally:
         _drop_paths(tmps)
+
+
+def _bilevel_attempt(src, size: tuple[int, int], stem: str, tag: int,
+                     tmps: list, target: float, meta_from
+                     ) -> tuple[bytes, tuple[int, int]] | None:
+    """One threshold probe at one size. (bytes, size) or None."""
+    try:
+        base = (src if tuple(src.size) == tuple(size)
+                else src.resize(size, Image.LANCZOS))
+        gray = base.convert("L")
+        # Downscaling blurs thin strokes into gray smears, so a size may
+        # fail the gate while another passes (photos fail everywhere:
+        # gradients persist across scales). Failed sizes are skipped.
+        if not _scan_like(gray, 128):
+            return None  # thresholding would posterize gradients
+        thr = _otsu_threshold(gray.histogram(), size[0] * size[1])
+        bilev = gray.point(lambda v, t=thr: 255 if v > t else 0, mode="1")
+        buf = io.BytesIO()
+        _save_png(bilev, buf, meta_from=meta_from)
+        cand = buf.getvalue()
+    except Exception:  # Pillow zoo on hostile inputs, next size
+        return None
+    if not cand.startswith(PNG_MAGIC):
+        return None
+    try:
+        ref_path = stem + f"_r{tag}.png"
+        ref_img = (src if tuple(src.size) == tuple(size)
+                   else src.resize(size, Image.LANCZOS))
+        ref_img.save(ref_path)
+        tmps.append(ref_path)
+        cand_path = stem + f"_c{tag}.png"
+        bilev.convert("RGB").save(cand_path)
+        tmps.append(cand_path)
+    except (OSError, ValueError):
+        return None
+    if tuple(bilev.size) != tuple(size):
+        return None
+    score = _ssim_score(ref_path, cand_path)
+    if score is not None and score >= target:
+        return cand, tuple(size)
+    return None
 
 
 def _lossy_variant(img: _Image, workdir: str, target: float,
@@ -2003,19 +2010,8 @@ def _deduplicate_final(images: list[_Image], finals: dict[int, bytes],
     {kind: full flattened bytes} feeds the kind counters. Validation
     failure keeps everything. Never raises.
     """
-    """Groups by digest of final bytes; survivor keeps its block, dup
-    blocks vanish and their hrefs point at the survivor.
-    """
     try:
-        if not images or len(images) < 2:
-            return images, skeleton, {}, 0, 0
-        groups: dict = {}
-        for img in images:
-            final = finals.get(img.idx, img.raw)
-            if not final:
-                continue
-            groups.setdefault(_digest(final), []).append(img)
-        dup_groups = [g for g in groups.values() if len(g) > 1]
+        dup_groups = _group_dup_finals(images, finals)
         if not dup_groups:
             return images, skeleton, {}, 0, 0
         remap: dict[str, str] = {}
@@ -2023,25 +2019,9 @@ def _deduplicate_final(images: list[_Image], finals: dict[int, bytes],
         dropped: dict[str, int] = {}
         reopened = 0
         for group in dup_groups:
-            ordered = sorted(group, key=lambda im: im.idx)
-            surv = ordered[0]
-            won = lossy is not None and any(
-                im.idx in mark_set for im in ordered)
-            if won:
-                mark_set.add(surv.idx)
-                if any(im.trail is not None and im.trail > lossy
-                       for im in ordered):
-                    reopened += 1
-                surv.trail = lossy
-            else:
-                try:
-                    marks = [im.trail for im in ordered
-                             if im.trail is not None]
-                    if marks:
-                        surv.trail = min(marks)
-                except (TypeError, ValueError):
-                    pass
-            for dup in ordered[1:]:
+            surv, dups, hit = _resolve_dup_group(group, mark_set, lossy)
+            reopened += hit
+            for dup in dups:
                 if dup.img_id == surv.img_id:
                     continue  # same id twice: invalid book, leave alone
                 remap[dup.img_id] = surv.img_id
@@ -2050,20 +2030,10 @@ def _deduplicate_final(images: list[_Image], finals: dict[int, bytes],
                 dropped[dup.kind] = dropped.get(dup.kind, 0) + full
         if not remap:
             return images, skeleton, {}, 0, 0
-        new_skeleton = skeleton
-        for dup_id, surv_id in remap.items():
-            try:
-                pat = re.compile(r"(<image\b[^>]*?\bhref\s*=\s*[\"'])#"
-                                 + re.escape(dup_id) + r"([\"'])",
-                                 re.IGNORECASE)
-            except re.error:
-                return (images, skeleton, {}, len(drop_idx), 0)
-            new_skeleton = pat.sub(r"\1#" + surv_id + r"\2", new_skeleton)
-        for img in images:
-            if img.idx in drop_idx:
-                block = (f"<binary{img.attrs}>__FB2OPT_{token}_{img.idx}__"
-                         f"</binary>")
-                new_skeleton = new_skeleton.replace(block, "", 1)
+        new_skeleton = _excise_dup_blocks(images, drop_idx, remap,
+                                          skeleton, token)
+        if new_skeleton is None:
+            return images, skeleton, {}, len(drop_idx), 0
         survivors = {img.img_id for img in images if img.idx not in drop_idx}
         if not _image_refs_ok(new_skeleton, survivors):
             return images, skeleton, {}, len(drop_idx), 0
@@ -2073,6 +2043,73 @@ def _deduplicate_final(images: list[_Image], finals: dict[int, bytes],
         return images, skeleton, {}, 0, 0
 
 
+def _group_dup_finals(images: list[_Image], finals: dict[int, bytes]
+                      ) -> list[list[_Image]]:
+    """Group images with identical final bytes. Never raises."""
+    try:
+        if not images or len(images) < 2:
+            return []
+        groups: dict = {}
+        for img in images:
+            final = finals.get(img.idx, img.raw)
+            if not final:
+                continue
+            groups.setdefault(_digest(final), []).append(img)
+        return [g for g in groups.values() if len(g) > 1]
+    except Exception:
+        return []
+
+
+def _resolve_dup_group(group: list[_Image], mark_set: set[int],
+                       lossy: float | None) -> tuple[_Image, list[_Image], int]:
+    """Pick the survivor; settle its mark. (surv, dups, reopened_bit)."""
+    ordered = sorted(group, key=lambda im: im.idx)
+    surv = ordered[0]
+    won = lossy is not None and any(im.idx in mark_set for im in ordered)
+    if won:
+        mark_set.add(surv.idx)
+        hit = 0
+        try:
+            if any(im.trail is not None and im.trail > lossy
+                   for im in ordered):
+                hit = 1
+        except TypeError:
+            hit = 0
+        surv.trail = lossy
+        return surv, ordered[1:], hit
+    try:
+        marks = [im.trail for im in ordered if im.trail is not None]
+        if marks:
+            surv.trail = min(marks)
+    except (TypeError, ValueError):
+        pass
+    return surv, ordered[1:], 0
+
+
+def _excise_dup_blocks(images: list[_Image], drop_idx: set[int],
+                       remap: dict[str, str], skeleton: str, token: str
+                       ) -> str | None:
+    """Remap hrefs and delete dup blocks. New skeleton or None. Never raises."""
+    try:
+        new_skeleton = skeleton
+        for dup_id, surv_id in remap.items():
+            try:
+                pat = re.compile(r"(<image\b[^>]*?\bhref\s*=\s*[\"'])#"
+                                 + re.escape(dup_id) + r"([\"'])",
+                                 re.IGNORECASE)
+            except re.error:
+                return None
+            new_skeleton = pat.sub(r"\1#" + surv_id + r"\2", new_skeleton)
+        for img in images:
+            if img.idx in drop_idx:
+                block = (f"<binary{img.attrs}>__FB2OPT_{token}_{img.idx}__"
+                         f"</binary>")
+                new_skeleton = new_skeleton.replace(block, "", 1)
+        return new_skeleton
+    except Exception:
+        return None
+
+
 # Whole optional blocks (all minOccurs=0 per FictionBook.xsd).
 _META_STRIP_BLOCKS = ("publish-info", "src-title-info", "custom-info",
                       "output", "stylesheet")
@@ -2080,7 +2117,8 @@ _META_STRIP_BLOCKS = ("publish-info", "src-title-info", "custom-info",
 _META_STRIP_DOCINFO = ("src-url", "src-ocr", "history", "program-used",
                        "publisher")
 # title-info children safe to drop (genre/title/annotation/cover/lang stay).
-_META_STRIP_TITLEINFO = ("keywords", "date", "translator")
+# translator deliberately kept: authorship attribution, not tech data.
+_META_STRIP_TITLEINFO = ("keywords", "date")
 
 
 def _strip_meta_tags(text: str) -> tuple[str, int, list[str]]:

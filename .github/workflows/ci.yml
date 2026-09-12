@@ -52,8 +52,8 @@ jobs:
       # Real ect 0.9.5 from source + real ffmpeg: catches byte-level
       # regressions (like v4.9 --reuse) and exercises the SSIM metric
       # paths that hermetic tests always mock.
-      - name: install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: install ffmpeg and stock jpegtran
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libjpeg-turbo-progs
       - name: cache ect build
         id: ect-cache
         uses: actions/cache@v4
