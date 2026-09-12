@@ -2695,7 +2695,7 @@ class TestSessionCache(unittest.TestCase):
         calls = {"n": 0}
         real = mod._process_image
 
-        def spy(img, workdir, have_ect, lossy, marks):
+        def spy(img, workdir, have_ect, lossy, marks, *args):
             calls["n"] += 1
             return real(img, workdir, have_ect, lossy, marks)
         with tempfile.TemporaryDirectory() as d:
@@ -2712,7 +2712,7 @@ class TestSessionCache(unittest.TestCase):
         marks: list = []
         calls = {"n": 0}
 
-        def winner(img, workdir, have_ect, lossy, mine):
+        def winner(img, workdir, have_ect, lossy, mine, *args):
             calls["n"] += 1
             mine.append(img.idx)  # like a lossy win does
             return img.idx, b"win-bytes"
@@ -2734,7 +2734,7 @@ class TestSessionCache(unittest.TestCase):
         calls = {"n": 0}
         real = mod._process_image
 
-        def spy(img, workdir, have_ect, lossy, marks):
+        def spy(img, workdir, have_ect, lossy, marks, *args):
             calls["n"] += 1
             return real(img, workdir, have_ect, lossy, marks)
         with tempfile.TemporaryDirectory() as d:
@@ -3134,6 +3134,47 @@ class TestCorpusGoldenPhotos(unittest.TestCase):
             self.assertLess(after, before)
             self.assertLessEqual(after, int(gold * self.TOL) + 1)
             self.assertIn("bin:", line)
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestSharedPool(unittest.TestCase):
+    def test_shared_pool_agrees(self):
+        raws = [_png_bytes(_solid("RGB", (32, 32), c))
+                for c in ((200, 30, 30), (30, 200, 30), (30, 30, 200))]
+        images = [mod._Image(idx=i, img_id=f"p{i}", kind="png", raw=r,
+                             orig_b64_len=10, attrs="", orig_body="")
+                  for i, r in enumerate(raws)]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                seq = mod.optimize_images(images, d, True, None, None, 1)
+        import concurrent.futures as _cf
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                ex = _cf.ThreadPoolExecutor(max_workers=4)
+                try:
+                    par = mod.optimize_images(images, d, True, None, None,
+                                              1, None, ex)
+                finally:
+                    ex.shutdown(wait=True)
+        self.assertEqual(seq, par)
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestEctFailure(unittest.TestCase):
+    """Single-file ect only: failures keep the original, never raise."""
+
+    def test_batch_failure_falls_back(self):
+        import random as _rnd
+        raw = (mod.PNG_MAGIC + _rnd.Random(3).randbytes(2000)
+               + mod.PNG_TRAILER)
+        img = mod._Image(idx=0, img_id="f", kind="png", raw=raw,
+                         orig_b64_len=10, attrs="", orig_body="")
+        with tempfile.TemporaryDirectory() as d:
+            def boom(cmd, **kw):
+                raise OSError("no ect")
+            with mock.patch.object(mod.subprocess, "run", boom):
+                r = mod.optimize_images([img], d, True)
+        self.assertEqual(r[0], raw)
 
 
 if __name__ == "__main__":

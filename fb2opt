@@ -701,6 +701,9 @@ def _process_image(img: _Image, workdir: str, have_ect: bool,
         return img.idx, _minify_svg_bytes(img.raw)  # XML text: no tools
     base = img.raw
     if have_ect and img.kind in ("png", "jpg"):
+        # NOTE: ect runs strictly one file per process. A batched
+        # `ect f1 f2...` was measured to change per-file bytes
+        # (14652 -> 14950 on real books), so no batching here.
         tmp = os.path.join(workdir, f"{img.idx:04d}_{sanitize_filename(img.img_id)}"
                                     f".{img.kind}")
         try:
@@ -796,7 +799,8 @@ def _process_cached(img: _Image, workdir: str, have_ect: bool,
 def optimize_images(images: list[_Image], workdir: str,
                     have_ect: bool, lossy: float | None = None,
                     lossy_marks: list[int] | None = None,
-                    workers: int = 1, img_cache: dict | None = None
+                    workers: int = 1, img_cache: dict | None = None,
+                    img_executor=None
                     ) -> dict[int, bytes]:
     """Run images through external optimizers.
 
@@ -806,12 +810,22 @@ def optimize_images(images: list[_Image], workdir: str,
     but only when strictly smaller than the lossless result.
     workers > 1 spreads images over threads (same bytes out).
     img_cache (optional per-batch dict) skips repeat compressions.
+    img_executor (optional shared batch pool) spreads images over its
+    threads instead of a private pool; bytes are identical either way.
     """
     result: dict[int, bytes] = {}
     if not images:
         return result
     os.makedirs(workdir, exist_ok=True)
     tools = _cache_settings(have_ect, lossy)
+    if img_executor is not None and len(images) > 1:
+        futs = [img_executor.submit(
+            _process_cached, img, workdir, have_ect, lossy,
+            lossy_marks, img_cache, tools) for img in images]
+        for fut in futs:
+            idx, final = fut.result()
+            result[idx] = final
+        return result
     if workers <= 1 or len(images) <= 1:
         for img in images:
             idx, final = _process_cached(img, workdir, have_ect, lossy,
@@ -2250,7 +2264,8 @@ def _assemble_blocks(images: list[_Image], optimized: dict[int, bytes],
 
 def optimize_fb2_payload(payload: bytes, workdir: str,
                          have_ect: bool, lossy: float | None = None,
-                         img_workers: int = 1, img_cache: dict | None = None
+                         img_workers: int = 1, img_cache: dict | None = None,
+                         img_executor=None
                          ) -> tuple[bytes, Fb2Stats]:
     """Optimize the bytes of one .fb2. Returns (new_bytes, stats).
 
@@ -2284,7 +2299,8 @@ def optimize_fb2_payload(payload: bytes, workdir: str,
 
     lossy_marks: list[int] = []
     optimized = optimize_images(images, workdir, have_ect, lossy,
-                                lossy_marks, img_workers, img_cache)
+                                lossy_marks, img_workers, img_cache,
+                                img_executor)
     mark_set = set(lossy_marks)
 
     # Dedup on final bytes: cross-format duplicates (same picture as
@@ -2638,7 +2654,8 @@ def _place_if_smaller(tmp_path: str, final_path: str, old_size: int,
 
 def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
                        registry: list[str], lossy: float | None = None,
-                       img_workers: int = 1, img_cache: dict | None = None
+                       img_workers: int = 1, img_cache: dict | None = None,
+                       img_executor=None
                        ) -> tuple[int, str]:
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
@@ -2683,7 +2700,7 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
             try:
                 new_data, member_stats = optimize_fb2_payload(
                     data, img_workdir, have_ect, lossy, img_workers,
-                    img_cache)
+                    img_cache, img_executor)
             except Fb2OptError as exc:
                 raise Fb2OptError(f"{info.filename}: {exc}") from exc
             stats.add(member_stats)
@@ -2711,7 +2728,8 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
 
 def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
                        registry: list[str], lossy: float | None = None,
-                       img_workers: int = 1, img_cache: dict | None = None
+                       img_workers: int = 1, img_cache: dict | None = None,
+                       img_executor=None
                        ) -> tuple[int, str]:
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
@@ -2727,7 +2745,7 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
     img_workdir = os.path.join(tmp_root, "img")
     new_payload, stats = optimize_fb2_payload(payload, img_workdir, have_ect,
                                                lossy, img_workers,
-                                               img_cache)
+                                               img_cache, img_executor)
 
     target = abs_path + ".zip"
     entries = [(_fresh_info(os.path.basename(abs_path), abs_path), new_payload)]
@@ -2779,7 +2797,8 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
                    registry: list[str], lossy: float | None = None,
-                   img_workers: int = 1, img_cache: dict | None = None
+                   img_workers: int = 1, img_cache: dict | None = None,
+                   img_executor=None
                    ) -> tuple[int, str]:
     """Optimize a single file; errors come as Fb2OptError."""
     if not isinstance(path, str) or not path:
@@ -2792,10 +2811,12 @@ def _optimize_one(path: str, tmp_root: str, have_ect: bool,
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
         return optimize_zip_file(path, per_file_tmp, have_ect, registry,
-                                 lossy, img_workers, img_cache)
+                                 lossy, img_workers, img_cache,
+                                 img_executor)
     if lowered.endswith(".fb2"):
         return optimize_fb2_file(path, per_file_tmp, have_ect, registry,
-                                 lossy, img_workers, img_cache)
+                                 lossy, img_workers, img_cache,
+                                 img_executor)
     raise Fb2OptError("need .fb2 or .zip")
 
 
@@ -3122,18 +3143,22 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
     # If an input is gone when the batch is done, say so loudly.
     before = {path: os.path.lexists(path) for path in expanded
               if isinstance(path, str) and path}
-    # All cores, no flag: files across threads, images inside a file
-    # across threads too (images win when the batch is a single book).
+    # All cores, no flag: one shared image pool for the whole batch.
+    # Static per-file image workers starve skewed batches (one fat book
+    # plus many thin ones); a shared pool keeps every core fed while
+    # results still merge by index, so bytes are identical.
     cpus = _cpu_count()
     file_workers = max(1, min(cpus, len(expanded)))
     img_workers = max(1, cpus // max(1, len(expanded)))
+    img_ex = concurrent.futures.ThreadPoolExecutor(max_workers=cpus)
 
     def _one(path: str, tmp_root: str) -> tuple[int, str | None,
                                                str | None, bool]:
         """Optimize one file. Returns (saved, stdout, stderr, failed)."""
         try:
             saved, line = _optimize_one(path, tmp_root, have_ect, registry,
-                                        lossy, img_workers, img_cache)
+                                        lossy, img_workers, img_cache,
+                                        img_ex)
         except Fb2OptError as exc:
             return 0, None, f"[error] {path}: {exc}", True
         except Exception as exc:
@@ -3197,7 +3222,12 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
         else:
             with tempfile.TemporaryDirectory(prefix="fb2opt-") as tmp_root:
                 _run_stream(tmp_root, acc)
+        img_ex.shutdown(wait=True)
     except KeyboardInterrupt:
+        try:
+            img_ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         _sweep_temps(registry)
         with _PRINT_LOCK:
             print("[interrupted]", file=sys.stderr, flush=True)
