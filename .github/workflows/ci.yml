@@ -49,8 +49,11 @@ jobs:
           python-version: "3.11"
       - name: install pillow
         run: pip install pillow
-      # Real ect 0.9.5 from source: catches byte-level regressions
-      # (like v4.9 --reuse) that hermetic tests cannot see.
+      # Real ect 0.9.5 from source + real ffmpeg: catches byte-level
+      # regressions (like v4.9 --reuse) and exercises the SSIM metric
+      # paths that hermetic tests always mock.
+      - name: install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
       - name: build ect
         run: |
           git clone --depth 1 --branch v0.9.5 \

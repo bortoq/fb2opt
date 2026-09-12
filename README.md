@@ -8,6 +8,9 @@ What it does:
   with `oxipng` installed its reductions run first and `ect --reuse` follows only their output, tiny PNGs try both modes;
   with `jpegtran` installed JPEGs get one extra entropy pass);
 - minifies XML markup (drops comments and extra whitespace);
+- stores byte-identical images once (references remapped); pays off when
+  copies are large or far apart — nearby small copies deflate packs
+  almost for free (32 KB window);
 - repacks the ZIP at max compression and runs `ect -zip` over it.
 
 The original file is replaced **only** if the new file is smaller
@@ -109,8 +112,9 @@ file itself and guarded by a metric — nothing is taken on faith.
   `stylesheet`. Required `id`/`version`/`date`, reader-visible fields,
   `body` and images always stay (XSD-checked, rollback on surprise).
   Keep a backup: this step is irreversible.
-- **Quality ladders.** Near-gray scans go 1-bit PNG first (Otsu, no dither,
-  one full-resolution retry if the metric fails); then JPEG 60→95
+- **Quality ladders.** Near-gray scans go 1-bit PNG first (Otsu, no dither;
+  a tile prefilter rejects gradients SSIM would miss, one full-resolution
+  retry if the metric fails); then JPEG 60→95
   (progressive, source chroma subsampling kept when the source is
   a JPEG); PNG palette 64→128→192 (no alpha images). Each candidate
   is scored against the original with **SSIM via
@@ -125,20 +129,22 @@ file itself and guarded by a metric — nothing is taken on faith.
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
   refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
-- No silent re-lossy: images `--lossy` compresses are recorded in the
-  `<program-used>` field as `fb2opt-lossy[0.92:id1,id2]` (schema-valid,
-  unlike a tag attribute). A re-run skips stamped images (only
+- No silent re-lossy: images `--lossy` compresses carry one marker byte
+  after the image trailer (`target*100`, e.g. 92), so `<binary>` tags stay
+  schema-clean and no markup is spent. A re-run skips stamped images (only
   a strictly lower target re-opens them), so quality never ratchets
-  down run after run. Old-style tag stamps migrate there on the next
-  `--lossy` run. The `marks:` entry in the result line is the stamp
-  overhead in bytes (usually negative and tiny — e.g. 19 stamps show
-  as `xml: -380` without it); `xml` itself stays honest.
+  down run after run. Old token/tag stamps migrate to bytes on the next
+  `--lossy` run. The `marks:` entry is the freed annotation bytes.
+  Note: strict validators may flag the trailing byte (PNG/JPEG themselves
+  allow data after the trailer, and readers ignore it) — keep a backup.
 - Presets (measured on painterly cover scans): `0.99` (conservative,
   safe everywhere) ≈ −10 % over lossless; `0.95` (balanced);
   `0.92` (default: ≈ −70 % on covers, SSIM ≈ 0.93 / PSNR ≈ 30 dB —
   smooth gradients show banding on zoom, invisible on e-ink gray).
   Text scans need higher qualities for the same score — the metric,
-  not a fixed `-m70`, decides per image.
+  not a fixed `-m70`, decides per image. For scanned books pass
+  `--lossy-ssim 0.85`: at the default 0.92 only very light pages go
+  1-bit, denser ones stay grayscale JPEG.
 - Escape hatch caveat: re-running with a strictly lower target
   re-compresses from the already-lossy pixels (originals are not kept),
   so the true quality to the original ends up below the new target.

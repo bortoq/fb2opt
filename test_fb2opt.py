@@ -2440,11 +2440,38 @@ class TestLossyBilevel(unittest.TestCase):
         self.assertNotEqual(tuple(work.size), tuple(im.size))
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(mod, "_ssim_score",
-                                   side_effect=[0.5, 0.999]) as m:
+                                   return_value=0.999) as m:
                 hit = mod._lossy_bilevel(im, img, d, 0.92)
         self.assertIsNotNone(hit)
         self.assertEqual(hit[1], tuple(im.size))  # winner is the full-res retry
-        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_count, 1)  # work size failed the tile gate
+
+    def test_tile_gate_rejects_gradient(self):
+        # Near-gray gradient: passes the chroma gate, fails the tile gate.
+        from PIL import Image as _I
+        grad = _I.new("L", (128, 128))
+        grad.putdata([x % 256 for y in range(128) for x in range(128)])
+        gray = grad.convert("RGB")
+        self.assertTrue(mod._is_exact_gray(gray))
+        self.assertFalse(mod._scan_like(grad, 128))
+        import io as _io
+        buf = _io.BytesIO()
+        gray.save(buf, "PNG")
+        img = self._img(buf.getvalue(), "png")
+        def _boom(a, b):
+            raise AssertionError("metric must not run on gradients")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(img.raw), img, d, 0.9))
+
+    def test_scan_like_units(self):
+        from PIL import Image as _I
+        white = _I.new("L", (32, 32), 255)
+        self.assertTrue(mod._scan_like(white, 128))
+        self.assertFalse(mod._scan_like(None, 128))
+        mid = _I.new("L", (32, 32), 128)
+        self.assertFalse(mod._scan_like(mid, 128))  # flat mid-gray: no text
 
     def test_no_retry_when_same_size(self):
         raw = self._scan_png()
@@ -2582,15 +2609,10 @@ class TestDedup(unittest.TestCase):
         self.assertEqual(new.count(b"<binary"), 2)
         self.assertEqual(stats.pics, 2)
 
-    def test_no_dedup_flag(self):
-        self.assertFalse(mod.parse_args(["b.fb2.zip"]).no_dedup)
-        self.assertTrue(mod.parse_args(["--no-dedup", "b.fb2.zip"]).no_dedup)
-        raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
-        fb2 = _dup_book(base64.b64encode(raw).decode())
-        with tempfile.TemporaryDirectory() as d:
-            new, _ = mod.optimize_fb2_payload(fb2, d, False,
-                                              dedup=False)
-        self.assertEqual(new.count(b"<binary"), 2)
+    def test_dedup_unconditional(self):
+        # No opt-out flag exists anymore: dedup is part of optimization.
+        with self.assertRaises(SystemExit):
+            mod.parse_args(["--no-dedup", "b.fb2.zip"])
 
     def test_rollback_on_dangling(self):
         raw = _png_bytes(_solid("RGB", (32, 32), (9, 9, 200)))
@@ -2871,11 +2893,79 @@ class TestCacheDedupUnits(unittest.TestCase):
         skel = text.replace("AA</binary>", "__P0__</binary>", 1)
         matches = list(mod.BINARY_RE.finditer(
             text.replace("__P0__", "AA")))
-        ni, ns, dropped, kept = mod._deduplicate(imgs, matches, skel, "T")
-        self.assertEqual(kept, 0)
+        finals = {0: r1, 1: r1, 2: r2}
+        ni, ns, dropped, kept, reop = mod._deduplicate_final(
+            imgs, finals, matches, skel, "T", set(), None)
+        self.assertEqual((kept, reop), (0, 0))
         self.assertEqual([i.img_id for i in ni], ["a", "c"])
         self.assertNotIn('href="#b"', ns)
         self.assertGreater(sum(dropped.values()), 0)
+
+
+@unittest.skipUnless(HAS_PIL and mod.have_ffmpeg(), "need Pillow + ffmpeg")
+class TestRealMetric(unittest.TestCase):
+    """Единственный тест с настоящей метрикой (живёт в byte-gate job)."""
+
+    def test_bilevel_real_ssim(self):
+        raw = _jpeg_bytes(_scan_rgb(300, 300), 95)
+        img = mod._Image(idx=0, img_id="s", kind="jpg", raw=raw,
+                         orig_b64_len=10, attrs="", orig_body="")
+        with tempfile.TemporaryDirectory() as d:
+            hit = mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.5)
+        self.assertIsNotNone(hit)
+        self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
+        self.assertEqual(mod._pil_open(hit[0]).mode, "1")
+
+
+class TestNewHelpersDirect(unittest.TestCase):
+    def test_svg_helpers(self):
+        self.assertTrue(mod._looks_like_svg(b"<svg></svg>"))
+        self.assertTrue(mod._looks_like_svg(b'  <?xml version="1.0"?><svg/>'))
+        self.assertFalse(mod._looks_like_svg(b"<?xml version=\"1.0\"?><html/>"))
+        self.assertFalse(mod._looks_like_svg(b""))
+        self.assertFalse(mod._looks_like_svg(mod.PNG_MAGIC + b"xx"))
+        a = "<svg><g><rect/></g><text>hi</text></svg>"
+        self.assertTrue(mod._svg_text_safe(a, a))
+        self.assertTrue(mod._svg_text_safe(a, "<svg><g><rect/></g><text>hi</text></svg>"))
+        self.assertFalse(mod._svg_text_safe(a, "<svg><g><rect/></g><text>bye</text></svg>"))
+        self.assertFalse(mod._svg_text_safe(a, "junk"))
+        self.assertFalse(mod._svg_text_safe(
+            a.replace("<text>", '<text xml:space="preserve">'), a))
+        self.assertEqual(mod._svg_align(""), "")
+        al = mod._svg_align("<svg><g><rect/></g></svg>")
+        import re as _re
+        for m in _re.finditer(r"<[^<>]*>", al):
+            self.assertEqual(m.start() % 3, 0)
+        self.assertEqual(mod._minify_svg_bytes(b""), b"")
+        self.assertEqual(mod._minify_svg_bytes(b"\xff\xfe junk"), b"\xff\xfe junk")
+        self.assertEqual(mod._minify_svg_bytes(mod.PNG_MAGIC), mod.PNG_MAGIC)
+
+    def test_orig_flat_len(self):
+        img = mod._Image(idx=0, img_id="a", kind="png", raw=b"123456",
+                         orig_b64_len=1, attrs="", orig_body="")
+        class _M:
+            def group(self, n):
+                return {0: "<binary>", 2: "QUJD"}[n]
+        self.assertEqual(mod._orig_flat_len(img, _M()), len("<binary>") + 4)
+        img2 = mod._Image(idx=0, img_id="a", kind="png", raw=b"123456",
+                          orig_b64_len=1, attrs="", orig_body="",
+                          rawtrail=0.9)
+        self.assertGreater(mod._orig_flat_len(img2, _M()),
+                           mod._orig_flat_len(img, _M()))
+
+    def test_extract_and_assemble(self):
+        fb2 = make_fb2()
+        text = fb2.decode("utf-8")
+        matches = list(mod._binary_matches(text))
+        imgs, skel, skipped = mod._extract_images(text, matches, "tok")
+        self.assertEqual((len(imgs), skipped), (1, 0))
+        self.assertIn("__FB2OPT_tok_0__", skel)
+        real_attrs = {i.idx: i.attrs for i in imgs}
+        stats = mod.Fb2Stats()
+        blocks, late, stripped = mod._assemble_blocks(
+            imgs, {0: imgs[0].raw}, set(), None, real_attrs, stats)
+        self.assertEqual(blocks[0], imgs[0].orig_body)
+        self.assertEqual((late, stripped), ([], 0))
 
 
 if __name__ == "__main__":
