@@ -1467,6 +1467,105 @@ def _lossy_png(im, img: _Image, workdir: str, target: float,
     return best
 
 
+def _otsu_threshold(hist: list[int], total: int) -> int:
+    """Otsu threshold for a 256-bin gray histogram. 128 on degenerate input."""
+    if not hist or total <= 0 or len(hist) < 256:
+        return 128
+    try:
+        sum_all = sum(i * h for i, h in enumerate(hist))
+    except TypeError:
+        return 128
+    sum_b = 0
+    w_b = 0
+    best = -1
+    best_thr = 128
+    for thr in range(256):
+        try:
+            w_b += hist[thr]
+        except (TypeError, IndexError):
+            return 128
+        if w_b <= 0:
+            continue
+        w_f = total - w_b
+        if w_f <= 0:
+            break
+        sum_b += thr * hist[thr]
+        mean_b = sum_b / w_b
+        mean_f = (sum_all - sum_b) / w_f
+        between = w_b * w_f * (mean_b - mean_f) ** 2
+        if between > best:
+            best = between
+            best_thr = thr
+    return best_thr
+
+
+def _lossy_bilevel(im, img: _Image, workdir: str, target: float
+                   ) -> tuple[bytes, tuple[int, int]] | None:
+    """1-bit PNG for scans, SSIM-gated, with a full-resolution retry.
+
+    First attempt runs at the downscaled work size; thin strokes may
+    vanish there and fail the metric, so one retry runs at the original
+    resolution, where thresholding preserves detail while the 1-bit PNG
+    stays tiny. No dithering: it only adds noise bytes. None — run the
+    regular JPEG/palette ladders instead.
+    """
+    if im is None or Image is None:
+        return None
+    if im.mode not in ("RGB", "L", "P"):
+        return None  # CMYK / alpha / exotic: keep lossless
+    if _has_alpha(im):
+        return None
+    work, ref = _scale_pair(im)
+    if work is None or ref is None:
+        return None
+    if not _is_exact_gray(work) and _gray_score(work) >= GRAY_PROBE_SCORE:
+        return None  # colorful: palette/JPEG ladder territory, skip the probe
+    try:
+        src = im if im.mode == "RGB" else im.convert("RGB")
+    except Exception:  # Pillow zoo on hostile inputs, keep lossless
+        return None
+    sizes = [tuple(work.size)]
+    if tuple(im.size) != tuple(work.size):
+        sizes.append(tuple(im.size))  # upscale retry at full resolution
+    stem = os.path.join(workdir, f"bilevel_{img.idx:04d}")
+    tmps: list[str] = []
+    try:
+        for n, size in enumerate(sizes):
+            try:
+                base = (src if tuple(src.size) == tuple(size)
+                        else src.resize(size, Image.LANCZOS))
+                gray = base.convert("L")
+                thr = _otsu_threshold(gray.histogram(), size[0] * size[1])
+                bilev = gray.point(lambda v, t=thr: 255 if v > t else 0,
+                                   mode="1")
+                buf = io.BytesIO()
+                _save_png(bilev, buf, meta_from=im)
+                cand = buf.getvalue()
+            except Exception:  # Pillow zoo on hostile inputs, next size
+                continue
+            if not cand.startswith(PNG_MAGIC):
+                continue
+            try:
+                ref_path = stem + f"_r{n}.png"
+                ref_img = (src if tuple(src.size) == tuple(size)
+                           else src.resize(size, Image.LANCZOS))
+                ref_img.save(ref_path)
+                tmps.append(ref_path)
+                cand_path = stem + f"_c{n}.png"
+                bilev.convert("RGB").save(cand_path)
+                tmps.append(cand_path)
+            except (OSError, ValueError):
+                continue
+            if tuple(bilev.size) != tuple(size):
+                continue
+            score = _ssim_score(ref_path, cand_path)
+            if score is not None and score >= target:
+                return cand, tuple(size)
+        return None
+    finally:
+        _drop_paths(tmps)
+
+
 def _lossy_variant(img: _Image, workdir: str, target: float,
                    base_cost: int | None = None
                    ) -> tuple[bytes, tuple[int, int]] | None:
@@ -1479,6 +1578,12 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
     im = _pil_open(img.raw)
     if im is None:
         return None
+    if img.kind in ("jpg", "png"):
+        # Scans first: a passing 1-bit PNG is all but surely the smallest
+        # option, so a hit skips the ladders below entirely.
+        hit = _lossy_bilevel(im, img, workdir, target)
+        if hit is not None:
+            return hit
     if img.kind == "jpg":
         return _lossy_jpeg(im, img, workdir, target, True, base_cost)
     if img.kind == "png":

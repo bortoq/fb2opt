@@ -2282,5 +2282,163 @@ class TestByteGate(unittest.TestCase):
                 self.assertTrue(mod._pixels_equal(res[0], raw))
 
 
+class TestOtsu(unittest.TestCase):
+    """Otsu: порог между пиками, 128 на вырожденном входе."""
+
+    def test_bimodal(self):
+        hist = [0] * 256
+        hist[30] = 1000
+        hist[220] = 1000
+        thr = mod._otsu_threshold(hist, 2000)
+        # any threshold inside the valley is optimal; impl takes the first
+        self.assertGreaterEqual(thr, 30)
+        self.assertLess(thr, 220)
+
+    def test_uniform_and_degenerate(self):
+        hist = [0] * 256
+        hist[200] = 500
+        self.assertEqual(mod._otsu_threshold(hist, 500), 128)
+        self.assertEqual(mod._otsu_threshold([], 0), 128)
+        self.assertEqual(mod._otsu_threshold([1, 2], -5), 128)
+        self.assertEqual(mod._otsu_threshold(None, 10), 128)
+
+
+def _scan_rgb(w=200, h=200):
+    from PIL import Image as _I
+    from PIL import ImageDraw as _D
+    im = _I.new("RGB", (w, h), "white")
+    d = _D.Draw(im)
+    for y in range(20, h, 18):
+        d.rectangle([20, y, w - 20, y + 8], fill="black")
+    return im
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestLossyBilevel(unittest.TestCase):
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="b", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def _scan_png(self, w=200, h=200):
+        import io as _io
+        buf = _io.BytesIO()
+        _scan_rgb(w, h).save(buf, "PNG")
+        return buf.getvalue()
+
+    def test_pass_at_work_size(self):
+        raw = self._scan_png()
+        img = self._img(raw, "png")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999) as m:
+                hit = mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.92)
+        self.assertIsNotNone(hit)
+        self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
+        self.assertEqual(m.call_count, 1)  # no retry needed
+        back = mod._pil_open(hit[0])
+        self.assertEqual(back.mode, "1")
+
+    def test_upscale_retry(self):
+        raw = self._scan_png(2500, 1800)  # downscaled work, full-res retry
+        img = self._img(raw, "png")
+        im = mod._pil_open(raw)
+        work, _ = mod._scale_pair(im)
+        self.assertNotEqual(tuple(work.size), tuple(im.size))
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score",
+                                   side_effect=[0.5, 0.999]) as m:
+                hit = mod._lossy_bilevel(im, img, d, 0.92)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[1], tuple(im.size))  # winner is the full-res retry
+        self.assertEqual(m.call_count, 2)
+
+    def test_no_retry_when_same_size(self):
+        raw = self._scan_png()
+        img = self._img(raw, "png")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.5) as m:
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.92))
+        self.assertEqual(m.call_count, 1)
+
+    def test_none_when_metric_missing(self):
+        raw = self._scan_png()
+        img = self._img(raw, "png")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=None):
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(raw), img, d, 0.92))
+
+    def test_guards_skip_before_metric(self):
+        from PIL import Image as _I
+        import io as _io
+        # alpha
+        buf = _io.BytesIO()
+        _I.new("RGBA", (32, 32), (1, 2, 3, 4)).save(buf, "PNG")
+        imga = self._img(buf.getvalue(), "png")
+        # colorful photo (high chroma, not a scan)
+        photo = _jpeg_bytes(_gradient(64, 64), 95)
+        imgp = self._img(photo, "jpg")
+        # exotic mode
+        cmyk = _jpeg_bytes(_gradient(32, 32).convert("CMYK"))
+        imgc = self._img(cmyk, "jpg")
+        def _boom(a, b):
+            raise AssertionError("metric must not run on guarded input")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(imga.raw), imga, d, 0.9))
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(imgp.raw), imgp, d, 0.9))
+                self.assertIsNone(
+                    mod._lossy_bilevel(mod._pil_open(imgc.raw), imgc, d, 0.9))
+                self.assertIsNone(mod._lossy_bilevel(None, imgp, d, 0.9))
+
+    def test_variant_prefers_bilevel(self):
+        raw = self._scan_png()
+        img = self._img(raw, "jpg")
+        sentinel = (mod.PNG_MAGIC + b"s", (8, 8))
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_bilevel",
+                                   return_value=sentinel):
+                with mock.patch.object(
+                        mod, "_lossy_jpeg",
+                        side_effect=AssertionError("ladder must not run")):
+                    with mock.patch.object(mod, "have_ffmpeg",
+                                           return_value=True):
+                        self.assertEqual(
+                            mod._lossy_variant(img, d, 0.9), sentinel)
+
+    def test_variant_falls_through(self):
+        raw = self._scan_png()
+        img = self._img(raw, "jpg")
+        sentinel = (b"jpeg-bytes", (8, 8))
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_lossy_bilevel", return_value=None):
+                with mock.patch.object(mod, "_lossy_jpeg",
+                                       return_value=sentinel):
+                    with mock.patch.object(mod, "have_ffmpeg",
+                                           return_value=True):
+                        self.assertEqual(
+                            mod._lossy_variant(img, d, 0.9), sentinel)
+
+    def test_end_to_end_scan_jpeg_becomes_bilevel_png(self):
+        raw = _jpeg_bytes(_scan_rgb(300, 300), 95)
+        self.assertGreater(len(raw), mod.LOSSY_MIN_BYTES)
+        fb2 = make_fb2(base64.b64encode(raw).decode())
+        fb2 = fb2.replace(b'content-type="image/png"',
+                          b'content-type="image/jpeg"', 1)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=0.999):
+                with mock.patch.object(mod, "run_tool", lambda cmd: True):
+                    with mock.patch.object(mod, "have_ffmpeg",
+                                           return_value=True):
+                        with mock.patch.object(mod, "_lossy_tools_ok",
+                                               return_value=True):
+                            with redirect_stderr(io.StringIO()):
+                                new, _ = mod.optimize_fb2_payload(
+                                    fb2, d, False, 0.92)
+        self.assertIn(b'content-type="image/png"', new)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

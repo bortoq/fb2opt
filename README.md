@@ -102,9 +102,11 @@ file itself and guarded by a metric — nothing is taken on faith.
   against the downscaled original, i.e. what the reader would show.
 - **Gray.** Exactly-gray RGB goes L directly; near-gray images get one
   extra L-mode probe at the winning quality (chroma costs bytes).
-- **Quality ladders.** JPEG 60→95 (progressive, source chroma subsampling
-  kept when the source is a JPEG); PNG palette 64→128→192 (no alpha
-  images). Each candidate is scored against the original with **SSIM via
+- **Quality ladders.** Near-gray scans go 1-bit PNG first (Otsu, no dither,
+  one full-resolution retry if the metric fails); then JPEG 60→95
+  (progressive, source chroma subsampling kept when the source is
+  a JPEG); PNG palette 64→128→192 (no alpha images). Each candidate
+  is scored against the original with **SSIM via
   ffmpeg**; the first candidate with SSIM ≥ threshold wins (default 0.92,
   `--lossy-ssim` overrides). Ladders walk upward instead of bisecting
   because quality is *not* monotonic under re-compression. SSIM (not
