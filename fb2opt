@@ -39,12 +39,13 @@ from dataclasses import dataclass
 from urllib.parse import unquote
 
 try:
-    from PIL import Image, ImageChops, ImageStat, PngImagePlugin
+    from PIL import Image, ImageChops, ImageStat, PngImagePlugin, ImageOps
 except ImportError:  # optional: Pillow tools (lossy + smart lossless)
     Image = None
     ImageChops = None
     ImageStat = None
     PngImagePlugin = None
+    ImageOps = None
 
 
 # --------------------------------------------------------------------------
@@ -125,7 +126,7 @@ def _sv(saved: int, unit: str = "bytes") -> str:
     except Exception:
         return f"saved {saved} {unit}"
 
-VERSION = "4.7"
+VERSION = "4.17"
 
 # Smart image heuristics (real-world files of unknown origin).
 LOSSY_MAX_SIDE = 1920   # downscale anything larger (reader screens end here)
@@ -682,6 +683,239 @@ def _looks_complete(kind: str, data: bytes) -> bool:
     return True
 
 
+# EXIF orientation is applied BEFORE any pass that drops EXIF (backlog):
+# ect -strip, exact PNG variants and lossy re-encodes all lose the tag,
+# which would rotate the picture on EXIF-honoring readers. JPEG rotation
+# is lossless only via jpegtran (a PIL round-trip re-quantizes), so
+# without jpegtran an oriented JPEG stays byte-exact with every pass
+# skipped. PNG re-encoding is lossless, so PNGs transpose in Pillow.
+_JPEGTRAN_ROTATE = {2: ["-flip", "horizontal"], 3: ["-rotate", "180"],
+                    4: ["-flip", "vertical"], 5: ["-transpose"],
+                    6: ["-rotate", "90"], 7: ["-transverse"],
+                    8: ["-rotate", "270"]}
+# Inverse operations for the round-trip check (each self-inverts
+# except the 90/270 pair).
+_JPEGTRAN_INVERSE = {2: ["-flip", "horizontal"], 3: ["-rotate", "180"],
+                     4: ["-flip", "vertical"], 5: ["-transpose"],
+                     6: ["-rotate", "270"], 7: ["-transverse"],
+                     8: ["-rotate", "90"]}
+# Decoder rounding between the jpegtran path and the Pillow reference
+# stays single-digit (measured 3); a wrong direction differs by tens.
+_JPEGTRAN_TOLERANCE = 16
+
+
+def _orientation_of(raw: bytes) -> int | None:
+    """EXIF orientation 1..8, None when absent/unreadable. Never raises."""
+    if Image is None or not raw:
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw))
+        tag = im.getexif().get(274)
+        if tag is None:
+            # TIFF keeps orientation outside EXIF (existing crossover
+            # guard reads the same tag).
+            tag_v2 = getattr(im, "tag_v2", None)
+            if tag_v2 is not None:
+                try:
+                    tag = tag_v2.get(274)
+                except (AttributeError, TypeError, KeyError):
+                    tag = None
+    except Exception:
+        return None
+    try:
+        tag = int(tag)
+    except (TypeError, ValueError):
+        return None
+    return tag if 1 <= tag <= 8 else None
+
+
+def _upright_equal(raw: bytes, out: bytes) -> bool:
+    """Decoded out matches the EXIF-upright reference of raw."""
+    if Image is None or ImageOps is None or not raw or not out:
+        return False
+    try:
+        ref = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
+        ref.load()
+        got = Image.open(io.BytesIO(out))
+        got.load()
+        if tuple(got.size) != tuple(ref.size):
+            return False
+        diff = ImageChops.difference(got.convert("RGB"),
+                                     ref.convert("RGB"))
+        return diff.getbbox() is None
+    except Exception:
+        return False
+
+
+def _max_abs_diff(a: bytes, b: bytes) -> int | None:
+    """Max per-channel abs difference of two decodable images. None if N/A."""
+    if Image is None or not a or not b:
+        return None
+    try:
+        ia = Image.open(io.BytesIO(a))
+        ia.load()
+        ib = Image.open(io.BytesIO(b))
+        ib.load()
+        if tuple(ia.size) != tuple(ib.size):
+            return None
+        diff = ImageChops.difference(ia.convert("RGB"), ib.convert("RGB"))
+        hist = diff.histogram()
+    except Exception:
+        return None
+    try:
+        top = 0
+        for ch in range(3):
+            band = hist[ch * 256:(ch + 1) * 256]
+            for level in range(255, top, -1):
+                if band[level]:
+                    top = level
+                    break
+        return top
+    except Exception:
+        return None
+
+
+def _transpose_jpeg_ok(raw: bytes, out: bytes, orientation: int,
+                       workdir: str, idx: int) -> bool:
+    """Triple check of a jpegtran transpose. Never raises.
+
+    Dimensions must match the operation class (5-8 swap sides), the
+    Pillow reference must agree within decoder rounding (a wrong
+    direction differs by tens), and the inverse transpose must restore
+    the original pixels exactly (both are DCT permutations, so any data
+    loss shows). Any doubt refuses the transpose.
+    """
+    if Image is None or ImageOps is None or not raw or not out:
+        return False
+    try:
+        ref = ImageOps.exif_transpose(Image.open(io.BytesIO(raw)))
+        ref.load()
+        got = Image.open(io.BytesIO(out))
+        got.load()
+        # ref is the upright reference: the output must match its size
+        # exactly (this alone pins the direction class: 5-8 swap sides).
+        if tuple(got.size) != tuple(ref.size):
+            return False
+        buf = io.BytesIO()
+        ref.save(buf, "PNG")
+        tol = _max_abs_diff(buf.getvalue(), out)
+        if tol is None or tol > _JPEGTRAN_TOLERANCE:
+            return False
+        inv = _JPEGTRAN_INVERSE.get(orientation)
+        if not inv:
+            return False
+        back = _transpose_run(out, inv, workdir, idx)
+        if back is None:
+            return False
+        ia = Image.open(io.BytesIO(raw))
+        ia.load()
+        ib = Image.open(io.BytesIO(back))
+        ib.load()
+        if tuple(ia.size) != tuple(ib.size):
+            return False
+        return ImageChops.difference(
+            ia.convert("RGB"), ib.convert("RGB")).getbbox() is None
+    except Exception:
+        return False
+
+
+def _transpose_run(raw: bytes, args: list, workdir: str, idx: int
+                   ) -> bytes | None:
+    """One jpegtran transform to a temp file, EXIF dropped. None on trouble."""
+    if not raw or not have_jpegtran():
+        return None
+    try:
+        handle, src = tempfile.mkstemp(dir=workdir, prefix=f"orx{idx:04d}_",
+                                       suffix=".jpg")
+        os.close(handle)
+        try:
+            with open(src, "wb") as fh:
+                fh.write(raw)
+        except OSError:
+            return None
+        dst = src + ".t.jpg"
+    except OSError:
+        return None
+    try:
+        if not run_tool(["jpegtran", "-copy", "none"] + list(args)
+                        + ["-outfile", dst, src]):
+            return None
+        try:
+            with open(dst, "rb") as fh:
+                out = fh.read()
+        except OSError:
+            return None
+        if not out or not _looks_complete("jpg", out):
+            return None
+        return out
+    finally:
+        _drop_paths([src, dst])
+
+
+def _transpose_jpeg(raw: bytes, orientation: int, workdir: str, idx: int
+                    ) -> bytes | None:
+    """Upright JPEG via jpegtran (no re-encode), EXIF dropped. None if N/A."""
+    args = _JPEGTRAN_ROTATE.get(orientation)
+    if (not args or not raw or not raw.startswith(JPEG_MAGIC)
+            or not have_jpegtran()):
+        return None
+    try:
+        out = _transpose_run(raw, args, workdir, idx)
+        if out is None:
+            return None
+        if _orientation_of(out) not in (None, 1):
+            return None  # tag survived somehow: refuse
+        return out if _transpose_jpeg_ok(raw, out, orientation,
+                                         workdir, idx) else None
+    except Exception:
+        return None
+
+
+def _transpose_png(raw: bytes) -> bytes | None:
+    """Upright PNG via Pillow (lossless re-encode), EXIF dropped."""
+    if Image is None or ImageOps is None or not raw:
+        return None
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+        fixed = ImageOps.exif_transpose(im)
+        out = _encode_png_bytes(fixed, im)
+    except Exception:
+        return None
+    if out is None or not out.startswith(PNG_MAGIC):
+        return None
+    if _orientation_of(out) not in (None, 1):
+        return None
+    return out if _upright_equal(raw, out) else None
+
+
+def _upright_image(img: _Image, workdir: str) -> tuple[_Image, bool]:
+    """EXIF-upright image plus a keep-everything flag. Never raises.
+
+    Returns (image to process, skip_all): skip_all means oriented but
+    with no lossless transpose available — the caller keeps the bytes
+    untouched, since any EXIF-dropping pass would rotate the display.
+    """
+    try:
+        if Image is None or img.kind not in ("png", "jpg"):
+            return img, False
+        orientation = _orientation_of(img.raw)
+        if orientation in (None, 1):
+            return img, False
+        if img.kind == "jpg":
+            fixed = _transpose_jpeg(img.raw, orientation, workdir, img.idx)
+        else:
+            fixed = _transpose_png(img.raw)
+        if not fixed:
+            return img, True
+        return _Image(idx=img.idx, img_id=img.img_id, kind=img.kind,
+                      raw=fixed, orig_b64_len=img.orig_b64_len,
+                      attrs=img.attrs, orig_body=img.orig_body,
+                      trail=img.trail, rawtrail=img.rawtrail), False
+    except Exception:
+        return img, False
+
+
 def _process_image(img: _Image, workdir: str, have_ect: bool,
                    lossy: float | None,
                    lossy_marks: list[int] | None) -> tuple[int, bytes]:
@@ -699,6 +933,12 @@ def _process_image(img: _Image, workdir: str, have_ect: bool,
         return img.idx, img.raw  # no optimizer at all: keep as is
     if img.kind == "svg":
         return img.idx, _minify_svg_bytes(img.raw)  # XML text: no tools
+    if Image is not None and img.kind in ("png", "jpg"):
+        # EXIF orientation decides display: upright the pixels before any
+        # pass that drops EXIF (ect -strip, exact variants, lossy).
+        img, skip_all = _upright_image(img, workdir)
+        if skip_all:
+            return img.idx, img.raw  # stripping would rotate it: keep
     base = img.raw
     if have_ect and img.kind in ("png", "jpg"):
         # NOTE: ect runs strictly one file per process. A batched
@@ -1341,17 +1581,121 @@ def _exact_png_candidates(img: _Image, im) -> list[tuple[bytes, str]]:
     return cands
 
 
+def _crossover_keep(enc, img: _Image) -> tuple[bytes, str] | None:
+    """Pixel-verified candidate or None. Never raises."""
+    try:
+        if enc is not None and _pixels_equal(enc, img.raw):
+            return (enc, "png")
+    except Exception:
+        pass
+    return None
+
+
+def _crossover_palette(img: _Image, im, n: int | None
+                       ) -> list[tuple[bytes, str]]:
+    """P-mode encodings: gray palettes go L, the rest trimmed + direct."""
+    cands: list[tuple[bytes, str]] = []
+    if im is None or Image is None:
+        return cands
+    try:
+        is_gray = _is_exact_gray(im.convert("RGB"))
+    except Exception:
+        is_gray = False
+    if is_gray and im.info.get("transparency") is None:
+        # Gray palette (common for seals and gray GIFs, which decode
+        # as P): L encoding beats any palette PNG. Transparent palettes
+        # stay P below: L cannot carry tRNS and the RGB pixel check
+        # would not catch its loss.
+        try:
+            enc = _encode_png_bytes(im.convert("L"), im)
+        except Exception:
+            enc = None
+        hit = _crossover_keep(enc, img)
+        return [hit] if hit is not None else []
+    try:
+        pal_size = len(im.getpalette()) // 3
+    except (TypeError, AttributeError):
+        pal_size = 256
+    if n is not None and 1 <= n < pal_size:
+        try:
+            trimmed = im.convert("RGB").quantize(
+                colors=max(n, 2), method=Image.MEDIANCUT,
+                dither=Image.Dither.NONE)
+            hit = _crossover_keep(_encode_png_bytes(trimmed, im), img)
+            if hit is not None:
+                cands.append(hit)
+        except Exception:
+            pass
+    # Original palette order sometimes deflates better: fallback.
+    hit = _crossover_keep(_encode_png_bytes(im, im), img)
+    if hit is not None:
+        cands.append(hit)
+    return cands
+
+
+def _crossover_rgb(img: _Image, im, n: int | None
+                   ) -> list[tuple[bytes, str]]:
+    """RGB encodings: direct plus a palette probe when few colors."""
+    cands: list[tuple[bytes, str]] = []
+    if im is None or Image is None:
+        return cands
+    hit = _crossover_keep(_encode_png_bytes(im.convert("RGB"), im), img)
+    if hit is not None:
+        cands.append(hit)
+    if n is not None and 1 <= n <= 256:
+        try:
+            pal = im.quantize(colors=max(n, 2), method=Image.MEDIANCUT,
+                              dither=Image.Dither.NONE)
+            hit = _crossover_keep(_encode_png_bytes(pal, im), img)
+            if hit is not None:
+                cands.append(hit)
+        except Exception:
+            pass
+    return cands
+
+
+def _crossover_encodings(img: _Image, im, n: int | None
+                         ) -> list[tuple[bytes, str]]:
+    """PNG re-encodings matched to the source mode. Never raises.
+
+    RGB re-encoding alone wastes palette/gray sources: a 193-color GIF
+    as RGB PNG is bigger than the GIF itself, while a palette/gray PNG
+    wins packed. The caller keeps the packed-smaller after its own ect
+    pass, so native encodings only add wins. Packed-sorted, best first.
+    """
+    cands: list[tuple[bytes, str]] = []
+    if im is None or Image is None:
+        return cands
+    try:
+        if im.mode == "L":
+            # Native gray: always the smallest for gray sources.
+            hit = _crossover_keep(_encode_png_bytes(im, im), img)
+            return [hit] if hit is not None else []
+        if im.mode == "P":
+            cands = _crossover_palette(img, im, n)
+        else:
+            cands = _crossover_rgb(img, im, n)
+    except Exception:
+        return cands
+    try:
+        cands.sort(key=lambda pair: _packed_cost(pair[0]))
+    except Exception:
+        pass
+    return cands
+
+
 def _exact_crossover_candidates(img: _Image, im
-                                ) -> list[tuple[bytes, str]]:
+                                 ) -> list[tuple[bytes, str]]:
     """Pixel-exact re-encoding into PNG, judged by content alone.
 
     The original container is irrelevant: any decodable flat graphic
     (JPEG ringing, BMP/PPM from sloppy converters, single-frame TIFF,
-    still GIF — all unreadable or wasteful somewhere) is tried as PNG
-    and kept only when packed-smaller. Skipped with EXIF/ICC aboard:
-    PNG cannot carry them, and EXIF orientation decides how readers
-    show the file — never flip silently. Animation and extra pages
-    always stay as is.
+    still GIF - all unreadable or wasteful somewhere) is tried as PNG
+    and kept only when packed-smaller. Encoding matches the source
+    mode (gray/palette stay gray/palette, not RGB). Skipped with
+    EXIF/ICC aboard: PNG cannot carry them, and EXIF orientation
+    decides how readers show the file - never flip silently. Animation
+    and extra pages always stay as is.
     """
     if img.kind not in ("jpg", "gif", "other"):
         return []
@@ -1387,11 +1731,13 @@ def _exact_crossover_candidates(img: _Image, im
     # hundreds; photos have orders of magnitude more.
     n = _distinct_colors(im, limit=4097)
     if n is None or not 1 <= n <= 4096:
-        return []
-    enc = _encode_png_bytes(im.convert("RGB"), im)
-    if enc is not None and _pixels_equal(enc, img.raw):
-        return [(enc, "png")]
-    return []
+        # Uncompressed BMP stores raw pixels, so even an RGB PNG wins
+        # packed by a mile: the color gate is skipped for BMP alone
+        # (GIF/TIFF stay gated - they are already compressed).
+        if img.raw[:2] != b"BM" or im.mode not in ("RGB", "L", "P"):
+            return []
+        n = None
+    return _crossover_encodings(img, im, n)
 
 
 def _squeeze_candidate(img: _Image, workdir: str, cb: bytes, ck: str,
@@ -1769,6 +2115,14 @@ def _otsu_threshold(hist: list[int], total: int) -> int:
 BILEVEL_TILE = 8  #(tile px) near-threshold density checked per tile
 BILEVEL_TOL = 25  # |v - thr| band around the Otsu threshold
 BILEVEL_LIMIT = 0.05  # any denser tile: not a scan, skip (12x/2x margins)
+# Mid-tone flatness gate (narrow-tone inlays the band gate cannot see).
+BILEVEL_MEAN_LO = 40  # tile-mean window: away from paper black
+BILEVEL_MEAN_HI = 215  # ...and away from paper white
+BILEVEL_VAR_CAP = 650  # tile variance cap: smooth, not strokes (noise blobs
+# ...peak near 550; stroke tiles sit orders of magnitude above)
+BILEVEL_STROKE_VAR = 2500  # above this: a stroke lives here, not a gradient
+BILEVEL_MIDFLAT = 0.005  # denser localized patch: posterization risk, skip
+BILEVEL_SPREAD = 0.6  # ...unless it spans the page: gray paper is no blob
 
 
 def _scan_like(gray, thr: int) -> bool:
@@ -1792,6 +2146,107 @@ def _scan_like(gray, thr: int) -> bool:
         return peak <= BILEVEL_LIMIT
     except Exception:
         return False
+
+
+def _midflat_varmap(gray, mp, tw: int, th: int, w: int, h: int
+                    ) -> dict[tuple[int, int], float]:
+    """Stride-2 sampled variance for mid-mean tiles. Empty on trouble."""
+    varmap: dict[tuple[int, int], float] = {}
+    try:
+        px = gray.load()
+    except Exception:
+        return varmap
+    try:
+        for ty in range(th):
+            for tx in range(tw):
+                if not BILEVEL_MEAN_LO <= mp[tx, ty] <= BILEVEL_MEAN_HI:
+                    continue
+                x0, x1 = (tx * w) // tw, ((tx + 1) * w) // tw
+                y0, y1 = (ty * h) // th, ((ty + 1) * h) // th
+                s = s2 = n = 0
+                for y in range(y0, y1, 2):
+                    for x in range(x0, x1, 2):
+                        v = px[x, y]
+                        s += v
+                        s2 += v * v
+                        n += 1
+                if n:
+                    varmap[(tx, ty)] = s2 / n - (s / n) ** 2
+    except Exception:
+        return {}
+    return varmap
+
+
+def _midflat_bad(varmap: dict[tuple[int, int], float], tw: int, th: int
+                 ) -> list[tuple[int, int]]:
+    """Smooth tiles away from strokes (ringing halos hug strokes)."""
+    bad: list[tuple[int, int]] = []
+    try:
+        for (tx, ty), var in varmap.items():
+            if var > BILEVEL_VAR_CAP:
+                continue
+            stroke_near = False
+            for ny in range(max(0, ty - 1), min(th, ty + 2)):
+                for nx in range(max(0, tx - 1), min(tx + 2, tw)):
+                    if (nx, ny) == (tx, ty):
+                        continue
+                    if varmap.get((nx, ny), -1) > BILEVEL_STROKE_VAR:
+                        stroke_near = True
+                        break
+                if stroke_near:
+                    break
+            if not stroke_near:
+                bad.append((tx, ty))
+    except Exception:
+        return []
+    return bad
+
+
+def _midflat_spread(bad: list[tuple[int, int]], tw: int, th: int) -> bool:
+    """Bad tiles span the page (background) rather than a patch."""
+    try:
+        if not bad or tw <= 0 or th <= 0:
+            return True
+        xs = [t[0] for t in bad]
+        ys = [t[1] for t in bad]
+        span_x = (max(xs) - min(xs) + 1) / tw
+        span_y = (max(ys) - min(ys) + 1) / th
+        return span_x > BILEVEL_SPREAD and span_y > BILEVEL_SPREAD
+    except Exception:
+        return True  # doubt favors the attempt, the metric still guards
+
+
+def _midflat_frac(gray) -> float | None:
+    """Fraction of tiles in a LOCALIZED smooth mid-tone patch. None on trouble.
+
+    Text tiles are extreme-mean (paper/ink) or high-variance (strokes);
+    smooth mid-tone tiles mean gradients or narrow-tone photo areas that
+    thresholding would posterize. A page-wide background (gray paper)
+    flags everywhere and is NOT a patch: only a concentrated one rejects
+    the attempt, so its bounding span must stay well below the page.
+    Means come from one C-speed BOX resize; variance is stride-2 sampled
+    inside exact BOX footprints (fixed-step windows would drift from what
+    BOX averaged and alias thin gaps into fake uniformity). Never raises.
+    """
+    if gray is None or Image is None:
+        return None
+    try:
+        w, h = gray.size
+        if w <= 0 or h <= 0:
+            return None
+        tw, th = max(1, w // BILEVEL_TILE), max(1, h // BILEVEL_TILE)
+        total = tw * th
+        bound = BILEVEL_MIDFLAT * total
+        mean = gray.resize((tw, th), Image.BOX)
+        bad = _midflat_bad(_midflat_varmap(gray, mean.load(), tw, th, w, h),
+                           tw, th)
+        if len(bad) <= bound:
+            return len(bad) / total
+        if _midflat_spread(bad, tw, th):
+            return 0.0  # page-wide background (gray paper), not a patch
+        return len(bad) / total
+    except Exception:
+        return None
 
 
 def _lossy_bilevel(im, img: _Image, workdir: str, target: float
@@ -1851,12 +2306,18 @@ def _bilevel_attempt(src, size: tuple[int, int], stem: str, tag: int,
         base = (src if tuple(src.size) == tuple(size)
                 else src.resize(size, Image.LANCZOS))
         gray = base.convert("L")
-        # Downscaling blurs thin strokes into gray smears, so a size may
-        # fail the gate while another passes (photos fail everywhere:
-        # gradients persist across scales). Failed sizes are skipped.
-        if not _scan_like(gray, 128):
-            return None  # thresholding would posterize gradients
+        # The band must guard the threshold actually used: a fixed 128
+        # misses photo inlays whose tones avoid mid-gray entirely while
+        # Otsu still finds a posterizing cut inside their range.
         thr = _otsu_threshold(gray.histogram(), size[0] * size[1])
+        # Downscaling blurs thin strokes into gray smears, so a size may
+        # fail one gate while another passes (photos fail everywhere:
+        # gradients persist across scales). Failed sizes are skipped.
+        if not _scan_like(gray, thr):
+            return None  # thresholding would posterize gradients
+        midflat = _midflat_frac(gray)
+        if midflat is not None and midflat > BILEVEL_MIDFLAT:
+            return None  # localized smooth mid-tone patch aboard
         bilev = gray.point(lambda v, t=thr: 255 if v > t else 0, mode="1")
         buf = io.BytesIO()
         _save_png(bilev, buf, meta_from=meta_from)
@@ -1895,6 +2356,11 @@ def _lossy_variant(img: _Image, workdir: str, target: float,
         marked = _lossy_mark(img.attrs or "")
     if marked is not None and target >= marked:
         return None  # already lossy at this (or gentler) target: never ratchet
+    if img.kind in ("gif", "other"):
+        # No lossless transpose exists for these containers: an oriented
+        # source would lose its rotation in the re-encode, so keep it.
+        if _orientation_of(img.raw) not in (None, 1):
+            return None
     im = _pil_open(img.raw)
     if im is None:
         return None
@@ -2269,6 +2735,20 @@ def _assemble_blocks(images: list[_Image], optimized: dict[int, bytes],
             if (lossy is not None and img.trail is not None
                     and lossy >= img.trail):
                 stats.marked += 1
+            # Canonical MIME even when the bytes stay: image/jpg (and any
+            # other spelling) becomes image/jpeg. Existing attribute only,
+            # never added here - the body is untouched, so is the markup.
+            try:
+                raw_attrs = real_attrs[img.idx]
+                final_kind = detect_kind(final, "")
+                if (final_kind in ("png", "jpg")
+                        and re.search(r'content-type\s*=',
+                                      raw_attrs or "", re.IGNORECASE)):
+                    norm = _set_content_type(raw_attrs, final_kind)
+                    if norm != raw_attrs:
+                        late.append((img.img_id, norm))
+            except Exception:
+                pass
             continue
         stored = (final if stored_trail is None
                   else _add_trail(final, stored_trail))
@@ -2284,7 +2764,10 @@ def _assemble_blocks(images: list[_Image], optimized: dict[int, bytes],
         attrs = (_strip_mark_from_attrs(raw_attrs) if lossy is not None
                  else raw_attrs)
         kind_stripped += len(raw_attrs) - len(attrs)
-        if final_kind in ("png", "jpg") and final_kind != img.kind:
+        if final_kind in ("png", "jpg"):
+            # Canonical MIME on every rewritten block: converted gif/bmp
+            # stragglers AND spellings like image/jpg become standard.
+            # Already-canonical tags come back unchanged (no churn).
             attrs = _set_content_type(attrs, final_kind)
         if attrs != raw_attrs:
             late.append((img.img_id, attrs))
@@ -2992,62 +3475,61 @@ def _find_replacement(img_id: str, img_dir: str) -> str | None:
     return None
 
 
-def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
-    """Put images from a folder into a book. Input untouched, writes packed_*."""
-    if not fb2_files:
-        print("[error] --pack: give a .fb2 book", file=sys.stderr)
-        return 2
-    if not img_dir or not os.path.isdir(img_dir):
-        print(f"[error] --pack: no image folder: {img_dir}",
-              file=sys.stderr)
-        return 2
-    failures = 0
-    for path in fb2_files:
+def _pack_replace(match: re.Match, img_dir: str, quiet: bool,
+                  updated: list) -> str:
+    """Swap one <binary> body for the folder file. Never raises."""
+    try:
+        attrs, _body = match.group(1), match.group(2)
+        id_match = ID_RE.search(attrs or "")
+        if not id_match:
+            return match.group(0)
+        found = _find_replacement(id_match.group(1), img_dir)
+        if found is None:
+            return match.group(0)
+        try:
+            with open(found, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return match.group(0)
+        if not data:
+            return match.group(0)
+        updated.append(1)
+        if not quiet:
+            print(f"  [updated] {_disp(os.path.basename(found))} "
+                  f"-> id='{_disp(id_match.group(1))}'", flush=True)
+        return f"<binary{attrs}>{encode_body(data)}</binary>"
+    except Exception:
+        try:
+            return match.group(0)
+        except Exception:
+            return ""
+
+
+def _pack_one(path: str, img_dir: str, quiet: bool) -> int:
+    """Pack folder images into one book. 0 ok, 1 failure. Never raises."""
+    try:
         if isinstance(path, str) and path.lower().endswith(".zip"):
             print(f"[error] --pack needs an unpacked .fb2, not an archive: {path}",
                   file=sys.stderr)
-            failures += 1
-            continue
+            return 1
         if not os.path.isfile(path):
             print(f"[error] {path}: file not found", file=sys.stderr)
-            failures += 1
-            continue
+            return 1
         try:
             with open(path, "rb") as fh:
                 payload = fh.read()
         except OSError as exc:
             print(f"[error] {path}: cannot read: {exc}", file=sys.stderr)
-            failures += 1
-            continue
+            return 1
         try:
             text, encoding = decode_fb2_payload(payload)
         except Fb2OptError as exc:
             print(f"[error] {path}: {exc}", file=sys.stderr)
-            failures += 1
-            continue
-        updated = 0
+            return 1
+        updated: list = []
 
-        def _replace(match: re.Match) -> str:
-            nonlocal updated
-            attrs, _body = match.group(1), match.group(2)
-            id_match = ID_RE.search(attrs or "")
-            if not id_match:
-                return match.group(0)
-            found = _find_replacement(id_match.group(1), img_dir)
-            if found is None:
-                return match.group(0)
-            try:
-                with open(found, "rb") as fh:
-                    data = fh.read()
-            except OSError:
-                return match.group(0)
-            if not data:
-                return match.group(0)
-            updated += 1
-            if not quiet:
-                print(f"  [updated] {_disp(os.path.basename(found))} "
-                      f"-> id='{_disp(id_match.group(1))}'", flush=True)
-            return f"<binary{attrs}>{encode_body(data)}</binary>"
+        def _one_replace(match: re.Match) -> str:
+            return _pack_replace(match, img_dir, quiet, updated)
 
         ignored = _ignored_spans(text)
         def _in_ignored(pos: int, _spans: tuple = tuple(ignored)) -> bool:
@@ -3061,12 +3543,12 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
             if _in_ignored(_m.start()):
                 continue
             _parts.append(text[_last:_m.start()])
-            _parts.append(_replace(_m))
+            _parts.append(_one_replace(_m))
             _last = _m.end()
         _parts.append(text[_last:])
         new_text = "".join(_parts)
-        if updated == 0:
-            continue
+        if not updated:
+            return 0
         directory, base = os.path.split(os.path.abspath(path))
         dest = unique_path(os.path.join(directory, f"packed_{base}"))
         try:
@@ -3074,10 +3556,26 @@ def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
                 fh.write(new_text.encode(encoding))
         except OSError as exc:
             print(f"[error] {dest}: not written: {exc}", file=sys.stderr)
-            failures += 1
-            continue
+            return 1
         if not quiet:
-            print(f"[done] {path}: images updated: {updated} → {dest}")
+            print(f"[done] {path}: images updated: {len(updated)} → {dest}")
+    except Exception:
+        return 1
+    return 0
+
+
+def cmd_pack(fb2_files: list[str], img_dir: str, quiet: bool) -> int:
+    """Put images from a folder into a book. Input untouched, writes packed_*."""
+    if not fb2_files:
+        print("[error] --pack: give a .fb2 book", file=sys.stderr)
+        return 2
+    if not img_dir or not os.path.isdir(img_dir):
+        print(f"[error] --pack: no image folder: {img_dir}",
+              file=sys.stderr)
+        return 2
+    failures = 0
+    for path in fb2_files:
+        failures += _pack_one(path, img_dir, quiet)
     return 1 if failures else 0
 
 
@@ -3160,20 +3658,56 @@ def _expand_sources(files: list[str], recursive: bool) -> list[str]:
     return expanded
 
 
+def _batch_env(quiet: bool, lossy: float | None) -> tuple[bool, int | None]:
+    """Toolchain preflight. (have_ect, early exit code or None)."""
+    try:
+        have_ect = shutil.which("ect") is not None
+    except Exception:
+        have_ect = False
+    try:
+        if not quiet and not have_ect:
+            print("[warning] ect not found — only XML and ZIP will shrink",
+                  file=sys.stderr, flush=True)
+        if lossy is not None and not _lossy_tools_ok():
+            missing = [m for m, ok in (("Pillow", have_pil()),
+                                       ("ffmpeg", have_ffmpeg())) if not ok]
+            print(f"[error] --lossy needs {' and '.join(missing)} "
+                  f"(pip install pillow; apt install ffmpeg)", file=sys.stderr)
+            return have_ect, 2
+    except OSError:
+        pass
+    return have_ect, None
+
+
+def _report_batch(expanded: list[str], before: dict[str, bool], acc: list,
+                  quiet: bool) -> int:
+    """Vanished-file census plus the Total line. Exit code. Never raises."""
+    failures, total_saved = acc
+    try:
+        for gone in _find_vanished(before):
+            with _PRINT_LOCK:
+                print(f"[error] {gone}: file disappeared during the run "
+                      f"(fb2opt never deletes books — restore it from backup "
+                      f"and check other processes)", file=sys.stderr, flush=True)
+            failures += 1
+        if not quiet and len(expanded) > 1:
+            file_word = "file" if len(expanded) == 1 else "files"
+            byte_word = "byte" if total_saved == 1 else "bytes"
+            with _PRINT_LOCK:
+                print(f"Total: {len(expanded)} {file_word}, "
+                      f"{_sv(total_saved, byte_word)}", flush=True)
+    except OSError:
+        pass
+    return 1 if failures else 0
+
+
 def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
                         recursive: bool, lossy: float | None = None
                         ) -> int:
     """Optimize a file list without falling on the first broken one."""
-    have_ect = shutil.which("ect") is not None
-    if not quiet and not have_ect:
-        print("[warning] ect not found — only XML and ZIP will shrink",
-              file=sys.stderr, flush=True)
-    if lossy is not None and not _lossy_tools_ok():
-        missing = [m for m, ok in (("Pillow", have_pil()),
-                                   ("ffmpeg", have_ffmpeg())) if not ok]
-        print(f"[error] --lossy needs {' and '.join(missing)} "
-              f"(pip install pillow; apt install ffmpeg)", file=sys.stderr)
-        return 2
+    have_ect, early = _batch_env(quiet, lossy)
+    if early is not None:
+        return early
     expanded = _expand_sources(files, recursive)
     registry: list[str] = []
     img_cache: dict = {}  # per-session image cache: identical bytes, one squeeze
@@ -3271,20 +3805,7 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
             print("[interrupted]", file=sys.stderr, flush=True)
         return 130
     _sweep_temps(registry)
-    failures, total_saved = acc
-    for gone in _find_vanished(before):
-        with _PRINT_LOCK:
-            print(f"[error] {gone}: file disappeared during the run "
-                  f"(fb2opt never deletes books — restore it from backup "
-                  f"and check other processes)", file=sys.stderr, flush=True)
-        failures += 1
-    if not quiet and len(expanded) > 1:
-        file_word = "file" if len(expanded) == 1 else "files"
-        byte_word = "byte" if total_saved == 1 else "bytes"
-        with _PRINT_LOCK:
-            print(f"Total: {len(expanded)} {file_word}, "
-                  f"{_sv(total_saved, byte_word)}", flush=True)
-    return 1 if failures else 0
+    return _report_batch(expanded, before, acc, quiet)
 
 
 if __name__ == "__main__":

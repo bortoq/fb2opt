@@ -1741,6 +1741,201 @@ class TestGenericFormats(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestCrossoverModes(unittest.TestCase):
+    """No gif/bmp leftovers: convertible images become PNG (lossless)."""
+
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="c", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def _gray_gif(self):
+        # Like the real 40x45 eldersign: L-mode GIF, ~190 gray levels.
+        # RGB re-encoding of this is bigger than the GIF itself.
+        from PIL import Image as _I
+        import io as _io
+        im = _I.new("L", (40, 45))
+        px = im.load()
+        for x in range(40):
+            for y in range(45):
+                px[x, y] = (x * 5 + y * 3) % 200
+        buf = _io.BytesIO()
+        im.save(buf, "GIF")
+        return buf.getvalue()
+
+    def test_gray_gif_becomes_gray_png(self):
+        raw = self._gray_gif()
+        self.assertTrue(raw.startswith(b"GIF8"))
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(raw, "gif"), d,
+                                             raw, False)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))
+        self.assertLess(len(out), len(raw))
+        self.assertLess(mod._packed_cost(out), mod._packed_cost(raw))
+        self.assertTrue(mod._pixels_equal(out, raw))
+        self.assertEqual(mod._pil_open(out).mode, "L")  # native, not RGB
+
+    def test_rich_palette_gif_trimmed(self):
+        from PIL import Image as _I
+        import io as _io
+        im = _I.new("RGB", (64, 64))
+        px = im.load()
+        for x in range(64):
+            for y in range(64):
+                px[x, y] = ((x * 4) % 256, (y * 4) % 256, ((x + y) * 2) % 256)
+        pal = im.quantize(colors=200, method=_I.MEDIANCUT,
+                          dither=_I.Dither.NONE)
+        buf = _io.BytesIO()
+        pal.save(buf, "GIF")
+        raw = buf.getvalue()
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(raw, "gif"), d,
+                                             raw, False)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))
+        self.assertLess(mod._packed_cost(out), mod._packed_cost(raw))
+        self.assertTrue(mod._pixels_equal(out, raw))
+
+    def test_bmp_photo_bypasses_color_gate(self):
+        # 128x128 gradient: 16384 distinct colors, the old 4096 cap kept
+        # the BMP as is; raw BMP must still become a tiny PNG.
+        from PIL import Image as _I
+        import io as _io
+        im = _I.new("RGB", (128, 128))
+        px = im.load()
+        for x in range(128):
+            for y in range(128):
+                px[x, y] = ((x * 2) % 256, (y * 2) % 256, (x + y) % 256)
+        buf = _io.BytesIO()
+        im.save(buf, "BMP")
+        raw = buf.getvalue()
+        self.assertTrue(raw.startswith(b"BM"))
+        self.assertIsNone(mod._distinct_colors(mod._pil_open(raw),
+                                              limit=4097))
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._try_lossless_variants(self._img(raw, "other"), d,
+                                             raw, False)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))
+        self.assertLess(len(out), len(raw) // 10)
+        self.assertTrue(mod._pixels_equal(out, raw))
+
+    def test_transparent_gif_stays(self):
+        from PIL import Image as _I
+        import io as _io
+        im = _I.new("P", (16, 16), 0)
+        px = im.load()
+        for x in range(8):
+            px[x, 0] = 3
+        buf = _io.BytesIO()
+        im.save(buf, "GIF", transparency=0)
+        raw = buf.getvalue()
+        self.assertIsNotNone(mod._pil_open(raw).info.get("transparency"))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(
+                mod._try_lossless_variants(self._img(raw, "gif"), d,
+                                           raw, False), raw)
+
+    def test_end_to_end_gif_rewritten_as_png(self):
+        import re as _re
+        raw = self._gray_gif()
+        body = base64.b64encode(raw).decode()
+        fb2 = ("<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+               "<FictionBook><description><title-info><genre>sf</genre>"
+               "<author><first-name>A</first-name><last-name>B</last-name>"
+               "</author><book-title>T</book-title></title-info>"
+               "<document-info><author><first-name>A</first-name>"
+               "<last-name>B</last-name></author>"
+               "<date value=\"2020-01-01\">2020</date><id>e2e-gif</id>"
+               "<version>1.0</version></document-info></description>"
+               "<body><section><p>Hi</p></section></body>"
+               f"<binary id=\"pic.gif\" content-type=\"image/gif\">"
+               f"{body}</binary></FictionBook>").encode()
+        with tempfile.TemporaryDirectory() as d:
+            new, stats = mod.optimize_fb2_payload(fb2, d, False)
+        text = new.decode("utf-8")
+        self.assertIn('content-type="image/png"', text)
+        self.assertNotIn("image/gif", text)
+        self.assertGreater(stats.other_saved, 0)
+        m = _re.search(r"<binary[^>]*>(.*?)</binary>", text, _re.S)
+        final = base64.b64decode(m.group(1).strip())
+        self.assertTrue(final.startswith(mod.PNG_MAGIC))
+        self.assertTrue(mod._pixels_equal(final, raw))
+
+    def test_crossover_encodings_direct(self):
+        from PIL import Image as _I
+        img = mod._Image(idx=0, img_id="e", kind="gif", raw=b"GIF89a..",
+                         orig_b64_len=1, attrs="", orig_body="")
+        self.assertEqual(mod._crossover_encodings(img, None, None), [])
+        with mock.patch.object(mod, "_pixels_equal", return_value=True):
+            with mock.patch.object(mod, "_encode_png_bytes",
+                                   return_value=b"PNG"):
+                self.assertEqual(mod._crossover_encodings(
+                    img, _I.new("L", (8, 8), 200), None), [(b"PNG", "png")])
+        red = _solid("RGB", (16, 16), "red")
+        import io as _io
+        buf = _io.BytesIO()
+        red.save(buf, "PNG")
+        img_png = mod._Image(idx=0, img_id="e", kind="gif",
+                             raw=buf.getvalue(), orig_b64_len=1, attrs="",
+                             orig_body="")
+        hits = mod._crossover_encodings(img_png, red, 1)
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(all(k == "png" for _, k in hits))
+        costs = [mod._packed_cost(c) for c, _ in hits]
+        self.assertEqual(costs, sorted(costs))  # best first
+
+    def test_max_abs_diff_direct(self):
+        a = _png_bytes(_solid("RGB", (8, 8), "red"))
+        self.assertEqual(mod._max_abs_diff(a, a), 0)
+        b = _png_bytes(_solid("RGB", (8, 8), "blue"))
+        self.assertGreater(mod._max_abs_diff(a, b), 0)
+        self.assertIsNone(mod._max_abs_diff(b"junk", a))
+        self.assertIsNone(mod._max_abs_diff(
+            a, _png_bytes(_solid("RGB", (8, 9), "red"))))
+
+    def test_mime_spelling_normalized(self):
+        # image/jpg is a JPEG already: only the spelling is non-standard.
+        jpg = _jpeg_bytes(_solid("RGB", (32, 32), "red"), 95)
+        other = _jpeg_bytes(_solid("RGB", (32, 32), "red"), 90)
+        self.assertNotEqual(jpg, other)
+        attrs = ' id="a" content-type="image/jpg"'
+        img = mod._Image(idx=0, img_id="a", kind="jpg", raw=jpg,
+                         orig_b64_len=10, attrs=attrs, orig_body="")
+        stats = mod.Fb2Stats(pics=1, skipped=0)
+        # Rewritten block: canonical MIME on the new tag.
+        blocks, late, _ = mod._assemble_blocks([img], {0: other}, set(),
+                                               None, {0: attrs}, stats)
+        self.assertIn((img.img_id, ' id="a" content-type="image/jpeg"'),
+                      late)
+        self.assertNotIn("image/jpg", blocks[0] + late[0][1])
+        # Kept block (bytes identical): tag spelling still normalized,
+        # body untouched.
+        stats = mod.Fb2Stats(pics=1, skipped=0)
+        blocks, late, _ = mod._assemble_blocks([img], {0: jpg}, set(),
+                                               None, {0: attrs}, stats)
+        self.assertEqual(blocks[0], "")
+        self.assertIn((img.img_id, ' id="a" content-type="image/jpeg"'),
+                      late)
+
+    def test_kept_gif_tag_untouched(self):
+        raw = b"GIF89a.."
+        attrs = ' id="g" content-type="image/gif"'
+        img = mod._Image(idx=0, img_id="g", kind="gif", raw=raw,
+                         orig_b64_len=10, attrs=attrs, orig_body="")
+        stats = mod.Fb2Stats(pics=1, skipped=0)
+        blocks, late, _ = mod._assemble_blocks([img], {0: raw}, set(),
+                                               None, {0: attrs}, stats)
+        self.assertEqual(late, [])  # convertible GIFs cross over as bytes;
+        # kept ones (animated/transparent) keep their honest tag.
+
+    def test_svg_stays_svg(self):
+        raw = (b'<svg xmlns="http://www.w3.org/2000/svg" width="10" '
+               b'height="10"><rect width="10" height="10"/></svg>')
+        img = self._img(raw, "svg")
+        with tempfile.TemporaryDirectory() as d:
+            out = mod.optimize_images([img], d, False, None, None, 1)
+        self.assertEqual(mod.detect_kind(out[0], ""), "svg")
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
 class TestDefaultPixelIdentity(unittest.TestCase):
     """Architectural invariant: default mode never changes decoded pixels.
 
@@ -2960,6 +3155,40 @@ class TestRealMetric(unittest.TestCase):
         self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
         self.assertEqual(mod._pil_open(hit[0]).mode, "1")
 
+    def test_variant_end_to_end_inlay_survives(self):
+        # Full _lossy_variant path with a real metric: a scan wins as
+        # 1-bit PNG, a photo inlay is never posterized (returns None or
+        # a non-bilevel variant, but never mode "1" from the inlay).
+        import random as _rnd
+        rng = _rnd.Random(9)
+        scan = _scan_rgb(300, 300)
+        simg = mod._Image(idx=0, img_id="s", kind="jpg",
+                          raw=_jpeg_bytes(scan, 95),
+                          orig_b64_len=10, attrs="", orig_body="")
+        photo = _scan_rgb(56, 42)
+        px = photo.load()
+        for x in range(56):
+            for y in range(42):
+                v = 100 + rng.randrange(40)
+                px[x, y] = (v, v, v)
+        page = _scan_rgb(300, 300)
+        page.paste(photo, (100, 120))
+        mimg = mod._Image(idx=1, img_id="m", kind="jpg",
+                          raw=_jpeg_bytes(page, 95),
+                          orig_b64_len=10, attrs="", orig_body="")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "have_ffmpeg", return_value=True):
+                with mock.patch.object(mod, "_lossy_tools_ok",
+                                       return_value=True):
+                    hit = mod._lossy_variant(simg, d, 0.92)
+                    self.assertIsNotNone(hit)
+                    self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
+                    miss = mod._lossy_variant(mimg, d, 0.92)
+        if miss is not None:
+            got = mod._pil_open(miss[0])
+            self.assertIsNotNone(got)
+            self.assertNotEqual(got.mode, "1")
+
 
 class TestNewHelpersDirect(unittest.TestCase):
     def test_svg_helpers(self):
@@ -3279,6 +3508,393 @@ class TestSplitHelpers(unittest.TestCase):
             self.assertIsNotNone(hit)
             self.assertEqual(hit[1], (64, 64))
             self.assertTrue(hit[0].startswith(mod.PNG_MAGIC))
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestSplitHelpers2(unittest.TestCase):
+    """Direct units for the crossover/midflat splits (budget gate)."""
+
+    def test_crossover_keep(self):
+        img = mod._Image(idx=0, img_id="k", kind="gif", raw=b"GIF89a..",
+                         orig_b64_len=1, attrs="", orig_body="")
+        self.assertIsNone(mod._crossover_keep(None, img))
+        self.assertIsNone(mod._crossover_keep(b"junk-bytes", img))
+        from PIL import Image as _I
+        import io as _io
+        buf = _io.BytesIO()
+        _I.new("L", (8, 8), 200).save(buf, "PNG")
+        enc = buf.getvalue()
+        with mock.patch.object(mod, "_pixels_equal", return_value=True):
+            self.assertEqual(mod._crossover_keep(enc, img), (enc, "png"))
+
+    def test_crossover_palette_and_rgb(self):
+        from PIL import Image as _I
+        import io as _io
+        red = _solid("RGB", (16, 16), "red")
+        buf = _io.BytesIO()
+        red.save(buf, "PNG")
+        img = mod._Image(idx=0, img_id="r", kind="other",
+                         raw=buf.getvalue(),
+                         orig_b64_len=1, attrs="", orig_body="")
+        self.assertEqual(mod._crossover_rgb(img, red, 1)[0][1], "png")
+        pal = red.quantize(colors=2, method=_I.MEDIANCUT)
+        hits = mod._crossover_palette(img, pal, 2)
+        self.assertTrue(hits and all(k == "png" for _, k in hits))
+        self.assertIsInstance(mod._crossover_palette(img, None, None), list)
+        self.assertIsInstance(mod._crossover_rgb(img, None, None), list)
+
+    def test_midflat_units(self):
+        from PIL import Image as _I
+        white = _I.new("L", (32, 32), 255).convert("RGB")
+        gray = white.convert("L")
+        tw = th = 4
+        mean = gray.resize((tw, th), _I.BOX)
+        vm = mod._midflat_varmap(gray, mean.load(), tw, th, 32, 32)
+        self.assertEqual(vm, {})  # paper-white: no candidates
+        self.assertEqual(mod._midflat_bad(vm, tw, th), [])
+        self.assertTrue(mod._midflat_spread([], tw, th))
+        self.assertFalse(mod._midflat_spread([(0, 0)], tw, th))
+        full = [(x, y) for x in range(tw) for y in range(th)]
+        self.assertTrue(mod._midflat_spread(full, tw, th))
+        self.assertEqual(mod._midflat_varmap(None, None, 0, 0, 0, 0), {})
+
+    def test_batch_env_direct(self):
+        with mock.patch.object(mod.shutil, "which", return_value=None):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(mod._batch_env(True, None), (False, None))
+        with mock.patch.object(mod.shutil, "which",
+                               side_effect=OSError("x")):
+            self.assertEqual(mod._batch_env(True, None), (False, None))
+        with mock.patch.object(mod, "_lossy_tools_ok", return_value=False):
+            with mock.patch.object(mod, "have_pil", return_value=False):
+                with mock.patch.object(mod, "have_ffmpeg",
+                                       return_value=False):
+                    with redirect_stderr(io.StringIO()):
+                        _, code = mod._batch_env(True, 0.92)
+                    self.assertEqual(code, 2)
+
+    def test_report_batch_direct(self):
+        self.assertEqual(mod._report_batch(["a"], {}, [0, 0], True), 0)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = mod._report_batch(["a", "b"], {}, [0, 100], False)
+        self.assertEqual(rc, 0)
+        self.assertIn("Total: 2 files", buf.getvalue())
+        with redirect_stderr(io.StringIO()):
+            rc = mod._report_batch(["a"], {"gone.fb2.zip": True},
+                                   [0, 0], True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(mod._report_batch(["a"], {}, [3, 0], True), 1)
+
+    def test_pack_helpers_direct(self):
+        import re as _re
+        m = _re.search(r"<binary([^>]*)>(.*?)</binary>",
+                       '<binary id="x">QQ==</binary>')
+        updated: list = []
+        self.assertEqual(mod._pack_replace(m, "/nonexistent-dir-xyz", True,
+                                           updated), m.group(0))
+        self.assertEqual(updated, [])
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "pic.png"), "wb") as fh:
+                fh.write(b"PNGDATA")
+            m = _re.search(r"<binary([^>]*)>(.*?)</binary>",
+                           '<binary id="pic">QQ==</binary>')
+            out = mod._pack_replace(m, d, True, updated)
+            self.assertIn(base64.b64encode(b"PNGDATA").decode(), out)
+            self.assertEqual(updated, [1])
+            self.assertEqual(mod._pack_one(os.path.join(d, "no.fb2"), d,
+                                           True), 1)
+            self.assertEqual(mod._pack_one(os.path.join(d, "a.zip"), d,
+                                           True), 1)
+            fb2path = os.path.join(d, "book.fb2")
+            with open(fb2path, "wb") as fh:
+                fh.write(make_fb2())
+            with open(os.path.join(d, "cover.png"), "wb") as fh:
+                fh.write(b"NEWPNG")
+            self.assertEqual(mod._pack_one(fb2path, d, True), 0)
+            self.assertTrue(os.path.isfile(
+                os.path.join(d, "packed_book.fb2")))
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestMidflatGate(unittest.TestCase):
+    def test_text_passes_blobs_fail(self):
+        page = _scan_rgb(200, 200)
+        self.assertEqual(mod._midflat_frac(page.convert("L")), 0.0)
+        import random as _rnd
+        rng = _rnd.Random(9)
+        blob = _scan_rgb(56, 42)
+        px = blob.load()
+        for x in range(56):
+            for y in range(42):
+                v = 100 + rng.randrange(40)
+                px[x, y] = (v, v, v)
+        page.paste(blob, (50, 50))
+        frac = mod._midflat_frac(page.convert("L"))
+        self.assertIsNotNone(frac)
+        self.assertGreater(frac, mod.BILEVEL_MIDFLAT)
+
+    def test_guards(self):
+        self.assertIsNone(mod._midflat_frac(None))
+        from PIL import Image as _I
+        tiny = _I.new("L", (4, 4), 200)
+        # A single tile always spans its page: background, not a patch.
+        self.assertEqual(mod._midflat_frac(tiny), 0.0)
+        white = _I.new("L", (32, 32), 255)
+        self.assertEqual(mod._midflat_frac(white), 0.0)
+
+    def test_end_to_end_blob_rejected(self):
+        import random as _rnd
+        rng = _rnd.Random(9)
+        page = _scan_rgb(300, 300)
+        blob = _scan_rgb(56, 42)
+        px = blob.load()
+        for x in range(56):
+            for y in range(42):
+                v = 100 + rng.randrange(40)
+                px[x, y] = (v, v, v)
+        page.paste(blob, (100, 120))
+        img = mod._Image(idx=0, img_id="m", kind="jpg", raw=b"z",
+                         orig_b64_len=1, attrs="", orig_body="")
+        def _boom(a, b):
+            raise AssertionError("metric must not run on smooth blobs")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", _boom):
+                self.assertIsNone(mod._lossy_bilevel(page, img, d, 0.92))
+
+
+    def _text_page(self, paper, nstrokes, w=500, h=700, seed=7):
+        import random as _rnd
+        from PIL import Image as _I
+        rng = _rnd.Random(seed)
+        im = _I.new("RGB", (w, h), (paper, paper, paper))
+        px = im.load()
+        for _ in range(nstrokes):
+            x, y = rng.randrange(w), rng.randrange(h - 4)
+            for dy in range(3):
+                for dx in range(rng.choice([6, 9, 14])):
+                    if x + dx < w:
+                        px[x + dx, y + dy] = (20, 20, 20)
+        return im
+
+    def _noise_inlay(self, lo, hi, w, h, seed=11):
+        import random as _rnd
+        from PIL import Image as _I
+        rng = _rnd.Random(seed)
+        im = _I.new("RGB", (w, h))
+        px = im.load()
+        for x in range(w):
+            for y in range(h):
+                v = rng.randrange(lo, hi + 1)
+                px[x, y] = (v, v, v)
+        return im
+
+    def test_audit_sized_noise_inlays_rejected(self):
+        # Audit v19 residual hole: 1%-area inlays whose tones avoid
+        # mid-gray entirely (dark 15-95, light 165-245). Both must die
+        # before the metric (which is blind there: SSIM 0.90 on a flat).
+        for lo, hi in ((15, 95), (165, 245)):
+            page = self._text_page(250, 2600, w=1000, h=1400)
+            page.paste(self._noise_inlay(lo, hi, 140, 105), (400, 600))
+            frac = mod._midflat_frac(page.convert("L"))
+            self.assertIsNotNone(frac)
+            self.assertGreater(frac, mod.BILEVEL_MIDFLAT,
+                               f"tones {lo}-{hi} slipped through")
+            img = mod._Image(idx=0, img_id="m", kind="jpg", raw=b"z",
+                             orig_b64_len=1, attrs="", orig_body="")
+            def _boom(a, b):
+                raise AssertionError("metric must not run on noise inlays")
+            with tempfile.TemporaryDirectory() as d:
+                with mock.patch.object(mod, "_ssim_score", _boom):
+                    self.assertIsNone(mod._lossy_bilevel(page, img, d, 0.92))
+
+    def test_gray_paper_is_no_patch(self):
+        # Uniform background flags everywhere: spread, not a patch, so
+        # gray-paper scans still reach bilevel (mocked metric passes).
+        page = self._text_page(200, 1300)
+        self.assertEqual(mod._midflat_frac(page.convert("L")), 0.0)
+        img = mod._Image(idx=0, img_id="g", kind="jpg", raw=b"z",
+                         orig_b64_len=1, attrs="", orig_body="")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "_ssim_score", return_value=1.0):
+                hit = mod._lossy_bilevel(page, img, d, 0.92)
+        self.assertIsNotNone(hit)
+        self.assertEqual(mod._pil_open(hit[0]).mode, "1")
+
+    def test_band_guards_otsu_threshold(self):
+        # The band must guard the cut actually used: uniform dark noise
+        # has nothing near 128 but everything near its Otsu threshold.
+        gray = self._noise_inlay(15, 95, 140, 105).convert("L")
+        thr = mod._otsu_threshold(gray.histogram(), 140 * 105)
+        self.assertLess(thr, 128)
+        self.assertFalse(mod._scan_like(gray, thr))
+        scan = _scan_rgb(200, 200).convert("L")
+        thr = mod._otsu_threshold(scan.histogram(), 200 * 200)
+        self.assertTrue(mod._scan_like(scan, thr))
+
+
+@unittest.skipUnless(HAS_PIL, "Pillow missing")
+class TestExifOrientation(unittest.TestCase):
+    """EXIF orientation is applied before any EXIF-dropping pass."""
+
+    def _oriented(self, w=64, h=48, ori=6, fmt="JPEG", **kw):
+        from PIL import Image as _I
+        import io as _io
+        im = _I.new("RGB", (w, h))
+        px = im.load()
+        for x in range(w):
+            for y in range(h):
+                px[x, y] = ((x * 4) % 256, (y * 6) % 256, 128)
+        ex = _I.Exif()
+        ex[274] = ori
+        buf = _io.BytesIO()
+        im.save(buf, fmt, exif=ex, **kw)
+        return buf.getvalue()
+
+    def _img(self, raw, kind):
+        return mod._Image(idx=0, img_id="o", kind=kind, raw=raw,
+                          orig_b64_len=10, attrs="", orig_body="")
+
+    def test_orientation_of_guards(self):
+        self.assertIsNone(mod._orientation_of(b""))
+        self.assertIsNone(mod._orientation_of(b"not-an-image"))
+        self.assertIsNone(mod._orientation_of(_jpeg_bytes(
+            _solid("RGB", (8, 8), "red"), 90)))  # no EXIF
+        self.assertEqual(mod._orientation_of(self._oriented()), 6)
+
+    def test_upright_image_guards(self):
+        img = self._img(b"GIF89a..", "gif")
+        same, skip = mod._upright_image(img, ".")
+        self.assertIs(same, img)
+        self.assertFalse(skip)
+        plain = self._img(_jpeg_bytes(_solid("RGB", (8, 8), "red"), 90),
+                          "jpg")
+        same, skip = mod._upright_image(plain, ".")
+        self.assertIs(same, plain)
+        self.assertFalse(skip)
+
+    @unittest.skipUnless(HAVE_JT, "need real jpegtran")
+    def test_jpeg_transposed_losslessly(self):
+        raw = self._oriented(64, 48, 6, quality=90)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            fixed, skip = mod._upright_image(img, d)
+            self.assertFalse(skip)
+            self.assertNotEqual(fixed.raw, raw)
+            self.assertIsNone(mod._orientation_of(fixed.raw))
+            self.assertEqual(mod._pil_open(fixed.raw).size, (48, 64))
+            self.assertTrue(mod._transpose_jpeg_ok(raw, fixed.raw, 6,
+                                                   d, 0))
+            idx, out = mod._process_image(img, d, False, None, None)
+            self.assertEqual(mod._pil_open(out).size, (48, 64))
+            self.assertIsNone(mod._orientation_of(out))
+
+    def test_jpeg_kept_without_jpegtran(self):
+        raw = self._oriented(64, 48, 6, quality=90)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "have_jpegtran",
+                                   return_value=False):
+                with mock.patch.object(mod, "run_tool") as rt:
+                    idx, out = mod._process_image(img, d, True, None, None)
+            self.assertEqual(out, raw)  # byte-exact: strip would rotate
+            rt.assert_not_called()  # ect never sees the oriented bytes
+
+    @unittest.skipUnless(HAVE_JT, "need real jpegtran")
+    def test_partial_mcu_kept(self):
+        # 60x40 is no multiple of the iMCU grid: jpegtran transposes it
+        # into garbage (rc 0!), so the triple check must refuse.
+        raw = self._oriented(60, 40, 6, quality=90)
+        img = self._img(raw, "jpg")
+        with tempfile.TemporaryDirectory() as d:
+            fixed, skip = mod._upright_image(img, d)
+            self.assertTrue(skip)
+            self.assertEqual(fixed.raw, raw)
+
+    def test_oriented_other_kept_lossless(self):
+        # No lossless transpose exists for gif/other containers: an
+        # oriented source must never reach the re-encoding ladders.
+        raw = self._oriented(64, 48, 6, quality=90)
+        img = self._img(raw, "other")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(mod, "have_ffmpeg", return_value=True):
+                self.assertIsNone(mod._lossy_variant(img, d, 0.92))
+                # Control: same container, no orientation → passes through.
+                plain = self._img(_jpeg_bytes(_solid("RGB", (64, 48),
+                                                       "red"), 90), "other")
+                with mock.patch.object(mod, "_lossy_bilevel",
+                                       return_value=(b"fake", (8, 8))):
+                    self.assertEqual(mod._lossy_variant(plain, d, 0.92),
+                                     (b"fake", (8, 8)))
+
+    def test_orientation_of_tiff_tag(self):
+        # TIFF keeps orientation outside EXIF (tag_v2 fallback).
+        class _FakeTag(dict):
+            def get(self, key, default=None):
+                return super().get(key, default)
+        class _FakeIm:
+            def getexif(self):
+                return {}
+            tag_v2 = _FakeTag({274: 6})
+        with mock.patch.object(mod.Image, "open", return_value=_FakeIm()):
+            self.assertEqual(mod._orientation_of(b"TIFF...."), 6)
+
+    @unittest.skipUnless(HAVE_JT, "need real jpegtran")
+    def test_transpose_helpers_direct(self):
+        raw = self._oriented(64, 48, 6, quality=90)
+        with tempfile.TemporaryDirectory() as d:
+            out = mod._transpose_run(raw, ["-rotate", "90"], d, 0)
+            self.assertTrue(out.startswith(mod.JPEG_MAGIC))
+            self.assertIsNone(mod._transpose_run(raw, ["-bogus-xyz"],
+                                                 d, 0))
+            with mock.patch.object(mod, "have_jpegtran",
+                                   return_value=False):
+                self.assertIsNone(mod._transpose_run(raw, ["-rotate",
+                                                           "90"], d, 0))
+            hit = mod._transpose_jpeg(raw, 6, d, 0)
+            self.assertTrue(hit.startswith(mod.JPEG_MAGIC))
+            self.assertIsNone(mod._transpose_jpeg(raw, 9, d, 0))
+            self.assertIsNone(mod._transpose_jpeg(b"junk", 6, d, 0))
+
+    def test_transpose_png_direct(self):
+        raw = self._oriented(60, 40, 6, fmt="PNG")
+        out = mod._transpose_png(raw)
+        self.assertTrue(out.startswith(mod.PNG_MAGIC))
+        self.assertEqual(mod._pil_open(out).size, (40, 60))
+        self.assertIsNone(mod._transpose_png(b"junk"))
+
+    def test_png_transposed_in_pillow(self):
+        raw = self._oriented(60, 40, 6, fmt="PNG")
+        self.assertEqual(mod._orientation_of(raw), 6)
+        img = self._img(raw, "png")
+        with tempfile.TemporaryDirectory() as d:
+            fixed, skip = mod._upright_image(img, d)
+            self.assertFalse(skip)
+            self.assertEqual(mod._pil_open(fixed.raw).size, (40, 60))
+            self.assertIsNone(mod._orientation_of(fixed.raw))
+            self.assertTrue(mod._upright_equal(raw, fixed.raw))
+
+
+class TestBenchSmoke(unittest.TestCase):
+    """bench.py runs hermetically on the in-repo corpus (no asserts on
+    byte values: without ect the savings legitimately differ)."""
+
+    def test_bench_runs_and_reports(self):
+        import importlib.machinery as _mach
+        bench_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "bench.py")
+        loader = _mach.SourceFileLoader("bench_mod", bench_path)
+        spec = importlib.util.spec_from_loader("bench_mod", loader)
+        bench = importlib.util.module_from_spec(spec)
+        sys.modules["bench_mod"] = bench
+        loader.exec_module(bench)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = bench.main(["bench.py"])
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("golden.fb2.zip", out)
+        self.assertIn("wall", out)
 
 
 if __name__ == "__main__":

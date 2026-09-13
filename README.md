@@ -1,5 +1,9 @@
 # fb2opt
 
+[![CI](https://github.com/bortoq/fb2opt/actions/workflows/ci.yml/badge.svg)](https://github.com/bortoq/fb2opt/actions/workflows/ci.yml)
+[![Python 3.9–3.13](https://img.shields.io/badge/python-3.9%E2%80%9313-blue)](https://github.com/bortoq/fb2opt)
+[![License](https://img.shields.io/github/license/bortoq/fb2opt)](LICENSE)
+
 Optimization of FB2 books packed as `.fb2.zip`. One Python script, no install needed.
 Uses all CPU cores (books and images in parallel) and caches repeated images within a run.
 
@@ -142,7 +146,14 @@ file itself and guarded by a metric — nothing is taken on faith.
   **only if strictly smaller** than the lossless result — otherwise
   the pixels stay bit-exact.
 - Needs `Pillow` (encoding) and `ffmpeg` (metric); without them `--lossy`
-  refuses to run. Transparency and exotic modes (CMYK…) stay lossless.
+  refuses to run. Transparency and exotic modes (CMYK…) stay lossless. EXIF orientation
+is applied before any pass that drops EXIF (`ect -strip`, re-encodes):
+JPEGs rotate via `jpegtran` without re-encoding (triple-checked: expected
+dimensions, Pillow reference within decoder rounding, exact inverse
+round-trip); PNGs transpose in Pillow. Without `jpegtran`, or on sizes
+outside the iMCU grid (where `jpegtran` silently mangles edges), an
+oriented source stays byte-exact with every pass skipped — stripping
+would rotate its display.
 - No silent re-lossy: images `--lossy` compresses carry one marker byte
   after the image trailer (`target*100`, e.g. 92), so `<binary>` tags stay
   schema-clean and no markup is spent. A re-run skips stamped images (only
@@ -151,6 +162,13 @@ file itself and guarded by a metric — nothing is taken on faith.
   `--lossy` run. The `marks:` entry is the freed annotation bytes.
   Note: strict validators may flag the trailing byte (PNG/JPEG themselves
   allow data after the trailer, and readers ignore it) — keep a backup.
+- 1-bit safety: the Otsu band guards the cut actually used (not a fixed
+  128), and a localized smooth mid-tone patch vetoes bilevel even when the
+  band is clear — so narrow-tone photo inlays survive with dozens of levels
+  instead of collapsing to a flat. Uniform gray paper is page-wide, not a
+  patch, and still goes 1-bit. Residual: sub-0.5 % smooth inlays and
+  full-page fog-like photos stay metric-blind by construction (SSIM cannot
+  see them) — inspect such books after `--lossy`.
 - Presets (measured on painterly cover scans): `0.99` (conservative,
   safe everywhere) ≈ −10 % over lossless; `0.95` (balanced);
   `0.92` (default: ≈ −70 % on covers, SSIM ≈ 0.93 / PSNR ≈ 30 dB —
@@ -167,10 +185,14 @@ file itself and guarded by a metric — nothing is taken on faith.
 
 Even the default lossless mode re-encodes when it can prove
 pixel-identity: exact gray → L, palette slack trim, RGB→palette,
-few-color JPEG → PNG, and stray BMP/PPM/TIFF/GIF from sloppy converters
-→ PNG (animation and extra pages always stay as is).
-A format change rewrites the `content-type`
-of the `<binary>` block, so the markup stays honest.
+and every still image in a non-standard container → PNG (GIF/BMP/PPM/
+single-frame TIFF, encoded in its native mode: gray stays gray, palette
+stays palette — an RGB re-encoding of those is often bigger than the
+original). No GIF/BMP leftovers remain except images that cannot move
+without losing data: animation, transparency, EXIF/ICC carriers and
+multi-page TIFFs. A format change rewrites the `content-type`
+of the `<binary>` block (spellings like `image/jpg` are canonicalized
+to `image/jpeg` even when the bytes stay), so the markup stays honest.
 
 Embedded SVG (XML text in base64) is minified like the FB2 markup
 itself — comments and inter-tag gaps go, tags/attributes/text are
@@ -185,6 +207,19 @@ collapses (a single space survives between two inline tags), comments
 outside CDATA are dropped, CDATA returns byte-exact. Unlike some
 optimizers, fb2opt never glues words together (`one` + `two` stays
 two words, not `onetwo`).
+
+## History
+
+- **4.17** — still images unified to PNG/JPEG (mode-native crossover, BMP gate
+  bypass, `image/jpg` canonicalization); bilevel gate hardened (band around the
+  actual Otsu cut, localized smooth-patch veto, gray paper still goes 1-bit);
+  EXIF orientation applied before EXIF-dropping passes; C901 complexity ratchet
+  in CI; reproducible `bench.py`.
+- **4.16** — `<translator>` kept, shared image pool for the batch, jpegtran
+  golden test, mid-tone tile gate, complex functions split.
+- **4.15 and earlier** — keep-min `ect`/`oxipng` chains, byte-exact dedup with
+  reference remap, SVG minify, SSIM-gated lossy ladders and 1-bit scans,
+  trailing-byte lossy marks, golden regression gates.
 
 ## License
 

@@ -38,7 +38,13 @@ jobs:
       - name: ruff F/B/UP gate
         run: |
           pip install "ruff==0.15.*"
-          ruff check --isolated --select F,B,UP fb2opt test_fb2opt.py
+          ruff check --isolated --select F,B,UP fb2opt test_fb2opt.py bench.py
+      # Complexity ratchet: pyproject pins today's maximum (23,
+      # _run_optimize_batch); any function growing past it fails here.
+      - name: ruff C901 budget gate
+        run: |
+          pip install "ruff==0.15.*"
+          ruff check --select C901 fb2opt test_fb2opt.py bench.py
 
   byte-gate:
     runs-on: ubuntu-latest

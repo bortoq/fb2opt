@@ -1,0 +1,5 @@
+# Minimal project config: only the linter budget lives here.
+# The F/B/UP gate stays --isolated (see ci.yml); C901 reads this file
+# and ratchets today's maximum so no function is allowed to grow.
+[tool.ruff.lint.mccabe]
+max-complexity = 23
