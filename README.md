@@ -52,6 +52,29 @@ cp fb2opt ~/bin/fb2opt
 chmod +x ~/bin/fb2opt
 ```
 
+## Windows
+
+1. Install Python 3.9+ from [python.org](https://www.python.org/downloads/)
+   (tick **“Add python.exe to PATH”** on the first installer screen —
+   this also installs the `py` launcher).
+2. Download `fb2opt` and `fb2opt.bat` from a
+   [release](https://github.com/bortoq/fb2opt/releases) into one folder
+   (e.g. `C:\tools\fb2opt`) — the `.bat` calls the script sitting next
+   to it, so keep them together.
+3. Run in Command Prompt:
+
+```cmd
+cd C:\tools\fb2opt
+fb2opt.bat BOOK.fb2.zip
+```
+
+(`py -3 fb2opt BOOK.fb2.zip` works too. To run from anywhere, add the
+folder to PATH via System → Environment Variables.)
+Optional tools are the same as on Linux: `Pillow`
+(`py -m pip install pillow`), `ffmpeg` (needed for `--lossy`), `ect`
+with its `oxipng`/`jpegtran` chain when available. Without them XML and
+ZIP still shrink; `--lossy` refuses to run and tells what is missing.
+
 ## Usage
 
 ```sh

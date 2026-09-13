@@ -1,0 +1,3 @@
+# Keep the Unix script LF-only (shebang) and the Windows launcher CRLF.
+/fb2opt text eol=lf
+*.bat text eol=crlf

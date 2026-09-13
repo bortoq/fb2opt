@@ -2945,11 +2945,11 @@ def _umask() -> int:
             return _CACHED_UMASK
         try:
             mask = os.umask(0)
-        except OSError:
-            return 0o022
+        except (OSError, AttributeError):
+            return 0o022  # no os.umask on Windows: fresh files use 0o666
         try:
             os.umask(mask)
-        except OSError:
+        except (OSError, AttributeError):
             pass
         _CACHED_UMASK = mask
         return mask
@@ -3674,7 +3674,7 @@ def _batch_env(quiet: bool, lossy: float | None) -> tuple[bool, int | None]:
             print(f"[error] --lossy needs {' and '.join(missing)} "
                   f"(pip install pillow; apt install ffmpeg)", file=sys.stderr)
             return have_ect, 2
-    except OSError:
+    except Exception:  # prints must never fail the preflight (hello, Windows consoles)
         pass
     return have_ect, None
 
@@ -3696,9 +3696,25 @@ def _report_batch(expanded: list[str], before: dict[str, bool], acc: list,
             with _PRINT_LOCK:
                 print(f"Total: {len(expanded)} {file_word}, "
                       f"{_sv(total_saved, byte_word)}", flush=True)
-    except OSError:
+    except Exception:  # the Total line must never fail the batch
         pass
     return 1 if failures else 0
+
+
+def _emit(saved: int, outline: str | None,
+        errline: str | None, failed: bool,
+        acc: list) -> None:
+    """Account one finished file and print its line at once. Never raises."""
+    acc[0] += failed
+    acc[1] += saved
+    try:
+        with _PRINT_LOCK:
+            if errline is not None:
+                print(errline, file=sys.stderr, flush=True)
+            if outline is not None:
+                print(outline, flush=True)
+    except Exception:
+        pass
 
 
 def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
@@ -3741,21 +3757,6 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
         if quiet:
             return saved, None, None, False
         return saved, line, None, False
-
-    def _emit(saved: int, outline: str | None,
-            errline: str | None, failed: bool,
-            acc: list) -> None:
-        """Account one finished file and print its line at once. Never raises."""
-        acc[0] += failed
-        acc[1] += saved
-        try:
-            with _PRINT_LOCK:
-                if errline is not None:
-                    print(errline, file=sys.stderr, flush=True)
-                if outline is not None:
-                    print(outline, flush=True)
-        except OSError:
-            pass
 
     def _run_stream(tmp_root: str, acc: list) -> None:
         """Run the batch, printing each file line as it finishes."""

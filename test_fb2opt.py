@@ -2029,6 +2029,32 @@ class TestAuditDirectCoverage(unittest.TestCase):
         [t.join() for t in ths]
         self.assertEqual(len(reg2), 200)
 
+    def test_umask_windows_fallback(self):
+        # No os.umask on Windows (AttributeError, not OSError): fresh
+        # files fall back to a sane default instead of crashing.
+        prev = mod._CACHED_UMASK
+        mod._CACHED_UMASK = None
+        try:
+            with mock.patch.object(mod.os, "umask",
+                                   side_effect=AttributeError("x")):
+                self.assertEqual(mod._umask(), 0o022)
+        finally:
+            mod._CACHED_UMASK = prev
+
+    def test_emit_direct(self):
+        acc = [0, 0]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod._emit(10, "outline", None, False, acc)
+        self.assertEqual(acc, [0, 10])
+        self.assertIn("outline", buf.getvalue())
+        acc = [0, 0]
+        with mock.patch("builtins.print",
+                         side_effect=UnicodeEncodeError("cp1251", "", 0,
+                                                        1, "x")):
+            mod._emit(10, "outline", "err", True, acc)  # never raises
+        self.assertEqual(acc, [1, 10])
+
     def test_deps_helpers(self):
         st = mod.dep_status()
         self.assertEqual(len(st), 5)
@@ -3873,6 +3899,21 @@ class TestExifOrientation(unittest.TestCase):
             self.assertEqual(mod._pil_open(fixed.raw).size, (40, 60))
             self.assertIsNone(mod._orientation_of(fixed.raw))
             self.assertTrue(mod._upright_equal(raw, fixed.raw))
+
+
+class TestWindowsWrapper(unittest.TestCase):
+    """The .bat launcher survives: references the script, forwards args."""
+
+    def test_bat_wrapper(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "fb2opt.bat")
+        with open(path, "rb") as fh:
+            data = fh.read()
+        self.assertIn(b"\r\n", data)  # CRLF: safe for stock cmd.exe
+        text = data.decode("utf-8")
+        self.assertIn("%~dp0fb2opt", text)  # script next to the launcher
+        self.assertIn("%*", text)  # args forwarded
+        self.assertIn("py", text)  # py launcher preferred
 
 
 class TestBenchSmoke(unittest.TestCase):
