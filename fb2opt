@@ -11,7 +11,8 @@ Replacement rule:
   otherwise the original is left untouched.
 
 The result line shows total saved bytes on disk, followed — in the same
-brackets — by the unpacked-FB2 breakdown by type: xml (markup), png, jpg.
+brackets — by the unpacked-FB2 breakdown: xml (markup), bin (images:
+PNG+JPEG+other merged), marks (freed annotation bytes).
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fnmatch
+import glob
 import hashlib
 import concurrent.futures
 import io
@@ -658,7 +661,8 @@ def short_hint() -> str:
         "Usage:\n"
         "  fb2opt BOOK.fb2.zip [...]         optimize (replace only if smaller)\n"
         "  fb2opt --lossy                    same, images also lossy (Pillow+ffmpeg)\n"
-        "  fb2opt -r                         walk current folder (.fb2.zip, nested)\n"
+        "  fb2opt -r                         walk current folder (.fb2.zip, nested;\n"
+        "                                  masks/names are searched in subfolders)\n"
         "  fb2opt BOOK.fb2 [...]             pack into .fb2.zip next to it\n"
         "  fb2opt --extract BOOK.fb2         pull images into current folder\n"
         "  fb2opt --pack BOOK.fb2            put images from current folder into the book\n"
@@ -3125,14 +3129,18 @@ def _verify_candidate(tmp_path: str, expected_names: list[str],
 
 def _warn_skipped(name: str, stats: Fb2Stats) -> None:
     """Report binary blocks that were left alone (stderr, result line untouched)."""
+    try:
+        label = _disp(name) if isinstance(name, str) and name else name
+    except Exception:
+        label = name
     if stats.skipped:
-        print(f"[warning] {name}: skipped {stats.skipped} bad <binary> blocks "
+        print(f"[warning] {label}: skipped {stats.skipped} bad <binary> blocks "
               f"(no id or broken base64)", file=sys.stderr)
     if stats.dedup_kept:
-        print(f"[warning] {name}: kept {stats.dedup_kept} duplicate blocks "
+        print(f"[warning] {label}: kept {stats.dedup_kept} duplicate blocks "
               f"(refs would dangle, left intact)", file=sys.stderr)
     if stats.reopened:
-        print(f"[warning] {name}: {stats.reopened} images re-opened "
+        print(f"[warning] {label}: {stats.reopened} images re-opened "
               f"at a stricter target — quality is measured against "
               f"the already-lossy pixels, not the original",
               file=sys.stderr, flush=True)
@@ -3181,7 +3189,7 @@ def optimize_zip_file(path: str, tmp_root: str, have_ect: bool,
     """Optimize a .zip archive in place (when it pays off). Returns (saved, line)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
-    name = os.path.basename(path)
+    name = _shorten(path)
     try:
         old_size = os.path.getsize(path)
     except OSError as exc:
@@ -3255,7 +3263,7 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
     """Pack a raw .fb2 into a sibling .fb2.zip (under the "write only if smaller" rule)."""
     if not os.path.isfile(path):
         raise Fb2OptError("file not found")
-    name = os.path.basename(path)
+    name = _shorten(path)
     abs_path = os.path.abspath(path)
     try:
         with open(abs_path, "rb") as fh:
@@ -3313,7 +3321,7 @@ def optimize_fb2_file(path: str, tmp_root: str, have_ect: bool,
     color = _use_color()
     return old_size - new_size, (f"{_disp(name)}: {_sv(old_size - new_size)} "
                                  f"({stats.breakdown(color)}) → "
-                                 f"{_disp(os.path.basename(target))}")
+                                 f"{_disp(_shorten(target))}")
 
 
 def _optimize_one(path: str, tmp_root: str, have_ect: bool,
@@ -3325,9 +3333,14 @@ def _optimize_one(path: str, tmp_root: str, have_ect: bool,
     if not isinstance(path, str) or not path:
         raise Fb2OptError("empty file name")
     if os.path.islink(path):
-        return 0, f"{os.path.basename(path)}: skipped (symlink, left untouched)"
+        return 0, (f"{_disp(_shorten(path))}: "
+                   f"skipped (symlink, left untouched)")
     if os.path.isdir(path):
         raise Fb2OptError("is a directory (use -r to walk it)")
+    if not os.path.isfile(path):
+        if _has_glob_magic(path):
+            raise Fb2OptError("file not found (masks need -r to search subfolders)")
+        raise Fb2OptError("file not found")
     lowered = path.lower()
     per_file_tmp = tempfile.mkdtemp(dir=tmp_root)
     if lowered.endswith(".zip"):
@@ -3600,7 +3613,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="print errors only")
     parser.add_argument("-r", "--recursive", action="store_true",
                         help="walk folders and optimize every .fb2.zip inside "
-                             "(current folder if omitted)")
+                             "(current folder if omitted); masks and exact "
+                             "names are searched in subfolders too, "
+                             "non-books are skipped")
     parser.add_argument("--lossy", action="store_true",
                         help="recompress PNG/JPEG with losses (needs Pillow+ffmpeg); "
                              "a lossy image is kept only if smaller")
@@ -3639,22 +3654,315 @@ def main(argv: list[str] | None = None) -> int:
                                  args.recursive, lossy)
 
 
+def _cwd() -> str | None:
+    """Absolute cwd, None when unreadable. Never raises."""
+    try:
+        return os.path.abspath(os.getcwd())
+    except Exception:
+        return None
+
+
+def _shorten(path: str, raw: bool = False) -> str:
+    """Short display path: relpath when inside cwd, else a fallback.
+
+    raw=False (result lines): outside cwd falls back to basename (compat);
+    raw=True (error lines): outside cwd keeps the path as given. Never raises.
+    """
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        ap = os.path.abspath(path)
+        cwd = _cwd()
+        if (cwd is not None and ap != cwd
+                and os.path.commonpath([ap, cwd]) == cwd):
+            rel = os.path.relpath(ap, cwd)
+            if rel and rel != ".":
+                return rel
+    except Exception:
+        pass
+    if raw:
+        return path
+    try:
+        return os.path.basename(path) or path
+    except Exception:
+        return ""
+
+
+def _is_book_path(path: str) -> bool:
+    """Book input: .fb2.zip or raw .fb2 (any case). Never raises."""
+    try:
+        low = path.lower()
+    except Exception:
+        return False
+    return low.endswith(".fb2.zip") or low.endswith(".fb2")
+
+
+def _has_glob_magic(text: str) -> bool:
+    """Glob chars present (*, ?, [). Never raises."""
+    try:
+        return isinstance(text, str) and bool(text) and any(
+            c in text for c in ("*", "?", "["))
+    except Exception:
+        return False
+
+
+def _walk_books(folder: str) -> list[str]:
+    """Every .fb2.zip under a folder. Never raises."""
+    out: list[str] = []
+    try:
+        if not isinstance(folder, str) or not folder:
+            return out
+        if not os.path.isdir(folder):
+            return out
+        for root, _, names in os.walk(folder, followlinks=False):
+            for fn in sorted(names):
+                # Packed books only: foreign zips stay out (no
+                # "no .fb2 in the archive" noise), raw .fb2 files are
+                # left alone (packing them would double the library).
+                if fn.lower().endswith(".fb2.zip"):
+                    out.append(os.path.join(root, fn))
+    except Exception:
+        pass
+    return out
+
+
+def _remember(hit: list[str], seen: set[str], full: str) -> None:
+    """Append one hit unless its absolute path is already taken. Never raises."""
+    try:
+        if not full or not isinstance(full, str):
+            return
+        key = os.path.abspath(full)
+    except Exception:
+        return
+    try:
+        if key in seen:
+            return
+        seen.add(key)
+        hit.append(full)
+    except Exception:
+        pass
+
+
+def _mask_spec(pat: str):
+    """Precompiled mask: (lowered, base, has-sep, has-**). None on garbage."""
+    try:
+        if not isinstance(pat, str) or not pat:
+            return None
+        return (pat.lower(), os.path.basename(pat).lower(),
+                (os.sep in pat) or ("/" in pat), "**" in pat)
+    except Exception:
+        return None
+
+
+def _exact_spec(name: str):
+    """Precompiled exact name: (base, base-low, norm, norm-low). None on garbage."""
+    try:
+        if not isinstance(name, str) or not name:
+            return None
+        want = os.path.basename(name)
+        norm = os.path.normpath(name)
+        return (want, want.lower(), norm, norm.lower())
+    except Exception:
+        return None
+
+
+def _file_matches_mask(fn_low: str, rel_low: str, spec) -> bool:
+    """Walk-file hit for a mask (basename, or relpath with a slash in it)."""
+    try:
+        low_pat, base_pat, need_sep, star_star = spec
+        if need_sep:
+            return (fnmatch.fnmatchcase(rel_low, low_pat)
+                    or (bool(star_star) and bool(base_pat)
+                        and fnmatch.fnmatchcase(fn_low, base_pat)))
+        return fnmatch.fnmatchcase(fn_low, low_pat)
+    except Exception:
+        return False
+
+
+def _dir_matches_mask(dn: str, rel: str, spec) -> bool:
+    """Directory hit for a mask (relpath with a slash in it, else basename)."""
+    try:
+        low_pat, _base, need_sep, _star = spec
+        target = rel.lower() if need_sep else dn.lower()
+        return fnmatch.fnmatchcase(target, low_pat)
+    except Exception:
+        return False
+
+
+def _file_matches_exact(fn: str, rel: str, espec) -> bool:
+    """Exact-name hit: basename or relpath, case-tolerant. Never raises."""
+    try:
+        want_base, low_want, norm, low_norm = espec
+        return (fn == want_base or rel == norm
+                or rel.lower() == low_norm or fn.lower() == low_want)
+    except Exception:
+        return False
+
+
+def _glob_direct(pat: str) -> list[str]:
+    """Direct glob hits (raw, unfiltered): files as is, books under matched dirs."""
+    hit: list[str] = []
+    seen: set[str] = set()
+    try:
+        matches = glob.glob(pat, recursive=True)
+    except Exception:
+        return hit
+    for m in matches or []:
+        try:
+            if os.path.isdir(m):
+                for b in _walk_books(m):
+                    _remember(hit, seen, b)
+            elif os.path.isfile(m):
+                _remember(hit, seen, m)
+        except Exception:
+            continue
+    return hit
+
+
+def _sweep_tree(queries):
+    """One os.walk over cwd serving every query. Returns (buckets, dirbooks).
+
+    buckets[i]: raw file hits of query i; dirbooks[i]: mask-matched dirs whose
+    books are added later. Never raises.
+    """
+    buckets = [[] for _ in queries]
+    dirbooks = [[] for _ in queries]
+    try:
+        cwd = _cwd()
+        if cwd is None or not os.path.isdir(cwd):
+            return buckets, dirbooks
+        walker = os.walk(cwd, followlinks=False)
+    except Exception:
+        return buckets, dirbooks
+    try:
+        for root, dirnames, filenames in walker:
+            for fn in filenames or []:
+                full = os.path.join(root, fn)
+                try:
+                    rel = os.path.relpath(full, cwd)
+                    fn_low, rel_low = fn.lower(), rel.lower()
+                except Exception:
+                    continue
+                for i, (kind, spec, _item) in enumerate(queries):
+                    try:
+                        if kind == "mask":
+                            if _file_matches_mask(fn_low, rel_low, spec):
+                                buckets[i].append(full)
+                        elif _file_matches_exact(fn, rel, spec):
+                            buckets[i].append(full)
+                    except Exception:
+                        continue
+            for dn in list(dirnames or []):
+                full = os.path.join(root, dn)
+                try:
+                    rel = os.path.relpath(full, cwd)
+                except Exception:
+                    continue
+                for i, (kind, spec, _item) in enumerate(queries):
+                    if kind != "mask":
+                        continue
+                    try:
+                        if _dir_matches_mask(dn, rel, spec):
+                            dirbooks[i].append(full)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return buckets, dirbooks
+
+
+def _resolved_pairs(queries):
+    """Per-query (item, (hits, raw_seen)): direct glob + one shared walk.
+
+    hits are books only, sorted; raw_seen tells a real miss (honest error)
+    from matched-but-not-a-book (silent skip). Never raises.
+    """
+    if not queries:
+        return []
+    try:
+        buckets, dirbooks = _sweep_tree(queries)
+    except Exception:
+        buckets, dirbooks = ([[] for _ in queries], [[] for _ in queries])
+    out = []
+    for i, (kind, _spec, item) in enumerate(queries):
+        try:
+            combo, seen = [], set()
+            if kind == "mask":
+                for b in _glob_direct(item):
+                    _remember(combo, seen, b)
+            for b in buckets[i]:
+                _remember(combo, seen, b)
+            if kind == "mask":
+                for d in dirbooks[i]:
+                    for b in _walk_books(d):
+                        _remember(combo, seen, b)
+            out.append((item, (sorted(b for b in combo if _is_book_path(b)),
+                               bool(combo))))
+        except Exception:
+            out.append((item, ([], False)))
+    return out
+
+
 def _expand_sources(files: list[str], recursive: bool) -> list[str]:
-    """Expand folders into book files when -r is given, else pass through."""
+    """Expand folders into book files when -r is given, else pass through.
+
+    With -r a mask or an exact name is also searched in subfolders (one shared
+    walk for all of them), so `*.fb2.zip` and a bare book name find nested books.
+    Non-books are skipped silently; a real miss still errors downstream.
+    """
     if not files:
         return []
+    if not recursive:
+        return list(files)
     expanded: list[str] = []
+    seen: set[str] = set()
+
+    def _add(path: str) -> None:
+        if not isinstance(path, str) or not path:
+            expanded.append(path)  # honest downstream error, never deduped
+            return
+        try:
+            _remember(expanded, seen, path)
+        except Exception:
+            expanded.append(path)
+
+    queries: list = []  # (kind, spec, item) needing the shared walk
     for item in files:
-        if recursive and isinstance(item, str) and os.path.isdir(item):
-            for root, _, names in os.walk(item, followlinks=False):
-                for fn in sorted(names):
-                    # Packed books only: foreign zips stay out (no
-                    # "no .fb2 in the archive" noise), raw .fb2 files are
-                    # left alone (packing them would double the library).
-                    if fn.lower().endswith(".fb2.zip"):
-                        expanded.append(os.path.join(root, fn))
+        if not isinstance(item, str) or not item:
+            expanded.append(item)
             continue
-        expanded.append(item)
+        try:
+            is_dir = os.path.isdir(item)
+            is_file = not is_dir and os.path.isfile(item)
+        except Exception:
+            is_dir, is_file = False, False
+        if is_dir:
+            for b in _walk_books(item):
+                _add(b)
+            continue
+        if is_file:
+            if _is_book_path(item):
+                _add(item)
+            continue  # non-books skipped silently
+        if _has_glob_magic(item):
+            spec = _mask_spec(item)
+            if spec is None:
+                _add(item)
+            else:
+                queries.append(("mask", spec, item))
+            continue
+        espec = _exact_spec(item)
+        if espec is None:
+            _add(item)
+        else:
+            queries.append(("exact", espec, item))
+    for item, (hits, raw_seen) in _resolved_pairs(queries):
+        if hits:
+            for b in hits:
+                _add(b)
+        elif not raw_seen:
+            _add(item)  # real miss: honest "file not found" downstream
+        # else: matched only non-books: silent skip
     return expanded
 
 
@@ -3686,7 +3994,8 @@ def _report_batch(expanded: list[str], before: dict[str, bool], acc: list,
     try:
         for gone in _find_vanished(before):
             with _PRINT_LOCK:
-                print(f"[error] {gone}: file disappeared during the run "
+                print(f"[error] {_disp(_shorten(gone, raw=True))}: "
+                      f"file disappeared during the run "
                       f"(fb2opt never deletes books — restore it from backup "
                       f"and check other processes)", file=sys.stderr, flush=True)
             failures += 1
@@ -3748,11 +4057,12 @@ def _run_optimize_batch(files: list[str], quiet: bool, keep_tmp: bool,
                                         lossy, img_workers, img_cache,
                                         img_ex)
         except Fb2OptError as exc:
-            return 0, None, f"[error] {path}: {exc}", True
+            return 0, None, f"[error] {_disp(_shorten(path, raw=True))}: {exc}", True
         except Exception as exc:
             # One bad file (encrypted/odd ZIP, bad disk) must not kill batch.
             return (0, None,
-                    f"[error] {path}: unexpected {type(exc).__name__}: {exc}",
+                    f"[error] {_disp(_shorten(path, raw=True))}: "
+                    f"unexpected {type(exc).__name__}: {exc}",
                     True)
         if quiet:
             return saved, None, None, False

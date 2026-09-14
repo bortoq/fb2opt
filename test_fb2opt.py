@@ -3938,5 +3938,180 @@ class TestBenchSmoke(unittest.TestCase):
         self.assertIn("wall", out)
 
 
+
+class TestRecursiveMasks(unittest.TestCase):
+    def _tree(self, d):
+        os.makedirs(os.path.join(d, "lorens stern"))
+        open(os.path.join(d, "lorens stern", "zhizn.fb2.zip"), "w").write("x")
+        open(os.path.join(d, "lorens stern", "other.txt"), "w").write("x")
+        open(os.path.join(d, "top.fb2.zip"), "w").write("x")
+        return d
+
+    def _chdir(self, d):
+        old = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, old)
+
+    def test_shorten_inside_shows_subfolders(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            self.assertEqual(mod._shorten(os.path.join(d, "lorens stern", "zhizn.fb2.zip")),
+                             os.path.join("lorens stern", "zhizn.fb2.zip"))
+            self.assertEqual(mod._shorten(os.path.join("lorens stern", "zhizn.fb2.zip")),
+                             os.path.join("lorens stern", "zhizn.fb2.zip"))
+
+    def test_shorten_outside_result_vs_error(self):
+        self.assertEqual(mod._shorten("/tmp/xyz/book.fb2.zip"), "book.fb2.zip")
+        self.assertEqual(mod._shorten("/tmp/xyz/book.fb2.zip", raw=True),
+                         "/tmp/xyz/book.fb2.zip")
+        self.assertEqual(mod._shorten(""), "")
+        self.assertEqual(mod._shorten(None), "")
+
+    def test_cwd_helper(self):
+        cwd = mod._cwd()
+        self.assertTrue(isinstance(cwd, str) and os.path.isabs(cwd))
+
+    def test_is_book_path(self):
+        self.assertTrue(mod._is_book_path("a.fb2.zip"))
+        self.assertTrue(mod._is_book_path("A.FB2.ZIP"))
+        self.assertTrue(mod._is_book_path("a.fb2"))
+        self.assertFalse(mod._is_book_path("a.txt"))
+        self.assertFalse(mod._is_book_path("a.zip"))
+        self.assertFalse(mod._is_book_path(""))
+        self.assertFalse(mod._is_book_path(None))
+
+    def test_has_glob_magic(self):
+        self.assertTrue(mod._has_glob_magic("*.fb2.zip"))
+        self.assertTrue(mod._has_glob_magic("a?.fb2.zip"))
+        self.assertTrue(mod._has_glob_magic("a[0].fb2.zip"))
+        self.assertFalse(mod._has_glob_magic("book.fb2.zip"))
+        self.assertFalse(mod._has_glob_magic(""))
+        self.assertFalse(mod._has_glob_magic(None))
+
+    def test_specs_and_matchers(self):
+        spec = mod._mask_spec("sub/*.fb2.zip")
+        self.assertEqual(spec[2:], (True, False))
+        self.assertTrue(mod._file_matches_mask("x.fb2.zip", "sub/x.fb2.zip", spec))
+        self.assertFalse(mod._file_matches_mask("x.fb2.zip", "other/x.fb2.zip", spec))
+        star = mod._mask_spec("**/*.fb2.zip")
+        self.assertTrue(star[3])
+        self.assertTrue(mod._file_matches_mask("x.fb2.zip", "sub/x.fb2.zip", star))
+        self.assertIsNone(mod._mask_spec(""))
+        self.assertIsNone(mod._mask_spec(None))
+        espec = mod._exact_spec("sub/b.fb2.zip")
+        self.assertTrue(mod._file_matches_exact("b.fb2.zip", "sub/b.fb2.zip", espec))
+        self.assertFalse(mod._file_matches_exact("c.fb2.zip", "sub/c.fb2.zip", espec))
+        self.assertIsNone(mod._exact_spec(""))
+        self.assertFalse(mod._file_matches_exact("a", "b", None))
+        self.assertFalse(mod._file_matches_mask("a", "b", None))
+        self.assertFalse(mod._dir_matches_mask("a", "b", None))
+
+    def test_walk_books_only_packed(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            out = mod._walk_books(os.path.join(d, "lorens stern"))
+            self.assertEqual([os.path.basename(p) for p in out], ["zhizn.fb2.zip"])
+            self.assertEqual(mod._walk_books(os.path.join(d, "nope")), [])
+            self.assertEqual(mod._walk_books(""), [])
+
+    def test_mask_found_in_subfolders(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            out = mod._expand_sources(["*.fb2.zip"], True)
+            base = sorted(os.path.basename(p) for p in out)
+            self.assertEqual(base, ["top.fb2.zip", "zhizn.fb2.zip"])
+            # case-insensitive extension
+            out2 = mod._expand_sources(["*.FB2.ZIP"], True)
+            self.assertEqual(sorted(os.path.basename(p) for p in out2), base)
+
+    def test_starstar_mask_finds_nested_and_top(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            out = mod._expand_sources(["**/*.fb2.zip"], True)
+            self.assertEqual(sorted(os.path.basename(p) for p in out),
+                             ["top.fb2.zip", "zhizn.fb2.zip"])
+
+    def test_multi_mask_one_walk(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            out = mod._expand_sources(["zhizn.fb2.zip", "top.fb2.zip"], True)
+            self.assertEqual(sorted(os.path.basename(p) for p in out),
+                             ["top.fb2.zip", "zhizn.fb2.zip"])
+            # same book twice -> deduped
+            out = mod._expand_sources(["lorens stern", "zhizn.fb2.zip"], True)
+            self.assertEqual(len(out), 1)
+
+    def test_exact_name_found_in_subfolders(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            out = mod._expand_sources(["zhizn.fb2.zip"], True)
+            self.assertEqual(len(out), 1)
+            self.assertTrue(out[0].endswith(os.path.join("lorens stern", "zhizn.fb2.zip")))
+
+    def test_submask_with_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            out = mod._expand_sources([os.path.join("lorens stern", "*.fb2.zip")], True)
+            self.assertEqual(len(out), 1)
+            self.assertIn("zhizn.fb2.zip", out[0])
+
+    def test_nonbooks_skipped_silently(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            # star matches everything, only books survive, no errors downstream
+            self.assertEqual(sorted(os.path.basename(p)
+                                    for p in mod._expand_sources(["*"], True)),
+                             ["top.fb2.zip", "zhizn.fb2.zip"])
+            # explicit non-book on disk: skipped, not an error
+            self.assertEqual(mod._expand_sources(["lorens stern/other.txt"], True), [])
+            # exact non-book name found in a subfolder: skipped
+            self.assertEqual(mod._expand_sources(["other.txt"], True), [])
+            # foreign zip (no .fb2 inside): skipped as well
+            zp = os.path.join(d, "plain.zip")
+            with zipfile.ZipFile(zp, "w") as z:
+                z.writestr("a.txt", b"hi")
+            self.assertEqual(mod._expand_sources(["plain.zip"], True), [])
+            self.assertEqual(mod._expand_sources(["*.zip"], True),
+                             sorted(mod._expand_sources(["*.fb2.zip"], True)))
+
+    def test_miss_kept_for_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            self._chdir(d)
+            self.assertEqual(mod._expand_sources(["nosuch.fb2.zip"], True), ["nosuch.fb2.zip"])
+            self.assertEqual(mod._expand_sources(["*.nomatch"], True), ["*.nomatch"])
+
+    def test_mask_hint_without_recursive(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(mod.Fb2OptError) as cm:
+                mod._optimize_one(os.path.join(d, "*.fb2.zip"),
+                                  tempfile.mkdtemp(dir=d), False, [])
+            self.assertIn("-r", str(cm.exception))
+            with self.assertRaises(mod.Fb2OptError) as cm2:
+                mod._optimize_one(os.path.join(d, "nosuch.fb2.zip"),
+                                  tempfile.mkdtemp(dir=d), False, [])
+            self.assertNotIn("-r", str(cm2.exception))
+
+    def test_nonrecursive_unchanged(self):
+        self.assertEqual(mod._expand_sources(["*.fb2.zip"], False), ["*.fb2.zip"])
+
+    def test_result_line_shows_subfolders(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            sub = os.path.join(d, "lorens stern", "zhizn.fb2.zip")
+            make_zip(sub, make_fb2())
+            self._chdir(d)
+            saved, line = mod.optimize_zip_file(os.path.join("lorens stern", "zhizn.fb2.zip"),
+                                                tempfile.mkdtemp(dir=d), False, [])
+            self.assertIn(os.path.join("lorens stern", "zhizn.fb2.zip"), line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

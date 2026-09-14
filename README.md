@@ -80,7 +80,9 @@ ZIP still shrink; `--lossy` refuses to run and tells what is missing.
 ```sh
 fb2opt BOOK.fb2.zip [BOOK2.fb2.zip ...]   # optimize (replace only if smaller)
 fb2opt --lossy                             # same, images also lossy
-fb2opt -r                                 # walk current folder (nested)
+fb2opt -r                                 # walk current folder (nested;
+#                                          masks/names are searched in subfolders,
+#                                          non-books are skipped)
 fb2opt BOOK.fb2 [...]                     # pack raw .fb2 into .fb2.zip next to it
 fb2opt --extract BOOK.fb2                 # pull images into current folder
 fb2opt --pack BOOK.fb2                    # put images from current folder into the book
@@ -90,16 +92,16 @@ fb2opt -h                                 # full help + dependencies
 Result line:
 
 ```text
-BOOK.fb2.zip: saved 126112 bytes (xml: 59555, jpg: 74415)
+BOOK.fb2.zip: saved 126112 bytes (xml: 59555, bin: 74415)
 ```
 
 The first number is real saved bytes on disk. In brackets — the
-unpacked-FB2 breakdown by type: `xml` (markup), `png`, `jpg`
-(`other` appears only if such images exist). Only types with
+unpacked-FB2 breakdown: `xml` (markup), `bin` (images: PNG+JPEG+other
+merged into one entry), `marks` (freed annotation bytes). Only entries with
 nonzero savings are shown. The bracket numbers always sum to
 the unpacked FB2 delta. Rewritten bodies are always single-line
 base64, and counters compare against the flattened original — so no
-wrapping style ever leaks into the numbers (a negative `png:`/`jpg:`
+wrapping style ever leaks into the numbers (a negative `bin:`
 only means the bytes genuinely grew while packing smaller —
 keeping the original would enlarge the archive).
 
